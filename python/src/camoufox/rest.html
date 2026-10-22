@@ -108,8 +108,8 @@
   </div>
 </details>
 <details>
-  <summary>Token</summary>
-  <input id="token" type="password" placeholder="CAMOUFOX_REST_TOKEN, when the service has one" autocomplete="off">
+  <summary>Token (required)</summary>
+  <input id="token" type="password" placeholder="CAMOUFOX_REST_TOKEN" autocomplete="off">
 </details>
 <div id="error"></div>
 
@@ -165,7 +165,7 @@
     const auth = $('token').value ? ' -H "Authorization: Bearer $CAMOUFOX_REST_TOKEN"' : '';
     const base = location.origin;
     return element('pre', [
-      "curl -s -X POST " + base + "/jobs" + auth + " -d '" + JSON.stringify(body).replaceAll("'", "'\\''") + "'",
+      "curl -s -X POST " + base + "/jobs" + auth + " -H 'Content-Type: application/json' -d '" + JSON.stringify(body).replaceAll("'", "'\\''") + "'",
       'curl -s ' + base + '/jobs/' + job.id + auth,
       'curl -s ' + base + '/jobs/' + job.id + '/result' + auth,
     ].join('\n'), 'calls');
