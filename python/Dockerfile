@@ -5,7 +5,8 @@
 #   docker run --rm --shm-size=1g -p 127.0.0.1:8000:8000 -e CAMOUFOX_REST_TOKEN camoufox-rest
 #
 # The service binds 0.0.0.0 inside the container, so it refuses to start
-# without CAMOUFOX_REST_TOKEN.
+# without CAMOUFOX_REST_TOKEN. Jobs have public-only, DNS-pinned TCP egress
+# unless the operator explicitly passes --allow-private-networks.
 #
 # Layers run from least to most often changed, so an edit rebuilds only what
 # follows the first layer it touches.

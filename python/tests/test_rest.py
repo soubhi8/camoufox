@@ -11,33 +11,253 @@ Run with:
 import asyncio
 import base64
 import json
+import socket
+import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 import pytest
+from click.testing import CliRunner
 
 from camoufox import rest
 
 PUBLIC_URL = "http://93.184.215.14/"
+DEFAULT_TOKEN = "rest-test-token"
 
 
-class FakeRequest:
-    def __init__(self, url, redirected_from=None):
-        self.url = url
-        self.redirected_from = redirected_from
+def wire_request(service, headers, method="POST", body=b""):
+    host, port = service._httpd.server_address[:2]
+    with socket.create_connection((host, port), timeout=3) as connection:
+        connection.sendall(
+            (f"{method} /jobs HTTP/1.1\r\n" + headers + "\r\n").encode() + body
+        )
+        return connection.recv(65536).split(b"\r\n", 1)[0]
 
 
-class FakeRoute:
-    def __init__(self, url):
-        self.request = FakeRequest(url)
-        self.outcome = None
+def test_default_public_mode_launches_with_required_prefs_and_a_context_gateway(context_options):
+    service, launcher = make_service()
+    with service:
+        _, job = request(service, "POST", "/jobs", {"url": PUBLIC_URL, "operation": "content"})
+        assert wait_finished(service, job["id"])["status"] == "succeeded"
+        assert launcher.prefs["media.peerconnection.enabled"] is False
+        assert launcher.prefs["network.proxy.allow_hijacking_localhost"] is True
+        assert launcher.prefs["network.proxy.no_proxies_on"] == ""
+        assert launcher.prefs["network.dns.disablePrefetch"] is True
+        assert launcher.prefs["network.http.speculative-parallel-limit"] == 0
+        assert launcher.prefs["network.prefetch-next"] is False
+        proxy = context_options[0]["_transport_proxy"]
+        assert proxy["server"].startswith("socks5://127.0.0.1:")
+        assert proxy.get("bypass", "") == ""
+        assert "webrtc_ip" not in context_options[0]
+    assert launcher.closed
 
-    async def abort(self, error_code):
-        self.outcome = error_code
 
-    async def continue_(self):
-        self.outcome = "continued"
+def test_public_mode_rejects_unsupported_custom_launchers():
+    with pytest.raises(TypeError, match="firefox_user_prefs"):
+        with rest.RestService(lambda: FakeLauncher(FakeBrowser()), port=0, token=DEFAULT_TOKEN):
+            pytest.fail("a launcher unable to enforce preferences was accepted")
+
+
+def test_loopback_also_requires_an_explicit_token():
+    with pytest.raises(ValueError, match=rest.TOKEN_ENV_VAR):
+        rest.RestService(lambda: FakeLauncher(FakeBrowser()), allow_private_networks=True)
+
+
+@pytest.mark.parametrize("headers", [
+    "Host: evil.example",
+    "Host: 127.0.0.1",
+    "Host: 127.0.0.1\r\nHost: evil.example",
+    "",
+])
+def test_untrusted_or_ambiguous_host_is_rejected(headers):
+    service, _ = make_service(allow_private_networks=True, token=DEFAULT_TOKEN)
+    with service:
+        status = wire_request(service, headers + "\r\n", method="GET")
+    assert b" 400 " in status or b" 403 " in status
+
+
+@pytest.mark.parametrize("extra", [
+    "Origin: https://evil.example\r\n",
+    "Origin: null\r\n",
+    "Authorization" + ": duplicate\r\n",
+    "Content-Length: 0\r\nContent-Length: 0\r\n",
+    "Transfer-Encoding: chunked\r\n",
+    "Content-Type: text/plain\r\n",
+    "Content-Type: application/json\r\nContent-Type: application/json\r\n",
+    "Origin: null\r\nOrigin: null\r\n",
+    "Forwarded: host=evil.example\r\n",
+    "X-Forwarded-Host: evil.example\r\n",
+    "Expect: 100-continue\r\n",
+    "Content-Type: application/json\r\nContent-Length: +1\r\n",
+])
+def test_untrusted_submission_headers_are_rejected_before_body(extra):
+    service, launcher = make_service(allow_private_networks=True, token=DEFAULT_TOKEN)
+    with service:
+        authority = urlsplit(service.url).netloc
+        status = wire_request(
+            service, f"Host: {authority}\r\n{'Authorization'}: {'Bearer'} {DEFAULT_TOKEN}\r\n{extra}"
+        )
+    assert b" 400 " in status or b" 403 " in status or b" 415 " in status
+    assert launcher.browser.contexts == []
+
+
+@pytest.mark.parametrize("operation", ["content", "screenshot"])
+def test_stored_result_has_a_serialized_byte_limit(operation, monkeypatch):
+    async def content(_self):
+        return "\N{SNOWMAN}" * 1024
+
+    async def screenshot(_self, full_page):
+        return b"x" * 1024
+
+    monkeypatch.setattr(FakePage, "content", content)
+    monkeypatch.setattr(FakePage, "screenshot", screenshot)
+    service, _ = make_service(
+        allow_private_networks=True, token=DEFAULT_TOKEN, max_result_bytes=512
+    )
+    with service:
+        _, job = request(service, "POST", "/jobs", {"url": PUBLIC_URL, "operation": operation},
+                         token=DEFAULT_TOKEN)
+        finished = wait_finished(service, job["id"], token=DEFAULT_TOKEN)
+        assert finished["status"] == "failed"
+        assert "result" in finished["error"]
+        assert service.jobs._jobs[job["id"]].result is None
+
+
+def test_nonfinite_job_numbers_are_rejected():
+    for value in (float("nan"), float("inf"), -float("inf")):
+        with pytest.raises(rest.InvalidJob):
+            rest.parse_job({"url": PUBLIC_URL, "operation": "content", "timeout": value}, 30)
+
+
+@pytest.mark.parametrize("field", ["url", "title"])
+def test_result_limit_includes_metadata(field, monkeypatch):
+    goto = FakePage.goto
+
+    async def navigate(page, url, wait_until):
+        await goto(page, url, wait_until)
+        if field == "url":
+            page.url += "x" * 1024
+
+    async def value(page):
+        return "x" * 1024 if field == "title" else "Example"
+
+    monkeypatch.setattr(FakePage, "goto", navigate)
+    monkeypatch.setattr(FakePage, "title", value)
+    service, _ = make_service(max_result_bytes=512)
+    with service:
+        _, job = request(service, "POST", "/jobs", {"url": PUBLIC_URL, "operation": "content"})
+        assert wait_finished(service, job["id"])["status"] == "failed"
+        assert service.jobs._jobs[job["id"]].result is None
+
+
+def test_stored_errors_are_byte_bounded_and_do_not_retain_tasks():
+    async def fail(_context, _url):
+        raise RuntimeError("\N{SNOWMAN}" * 10000)
+
+    service, _ = make_service(FakeBrowser(on_goto=fail), max_result_bytes=512)
+    with service:
+        _, job = request(service, "POST", "/jobs", {"url": PUBLIC_URL, "operation": "content"})
+        finished = wait_finished(service, job["id"])
+        assert len(finished["error"].encode()) <= 512
+        assert service.jobs._jobs[job["id"]].task is None
+
+
+def test_authentication_is_checked_without_reading_the_body():
+    service, launcher = make_service()
+    with service:
+        status = wire_request(
+            service, f"Host: {urlsplit(service.url).netloc}\r\n"
+            "Content-Type: application/json\r\nContent-Length: 1234\r\n"
+        )
+    assert b" 401 " in status
+    assert launcher.browser.contexts == []
+
+
+def test_same_origin_is_accepted():
+    service, _ = make_service()
+    with service:
+        status = wire_request(
+            service, f"Host: {urlsplit(service.url).netloc}\r\nOrigin: {service.url}\r\n",
+            method="GET",
+        )
+    assert b" 401 " in status
+
+
+def test_wildcard_bind_accepts_only_the_actual_local_ip():
+    service, _ = make_service(host="0.0.0.0")
+    with service:
+        port = service._httpd.server_address[1]
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+            connection.sendall(f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode())
+            assert b" 200 " in connection.recv(4096)
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+            connection.sendall(f"GET / HTTP/1.1\r\nHost: evil.example:{port}\r\n\r\n".encode())
+            assert b" 400 " in connection.recv(4096)
+
+
+@pytest.mark.parametrize("body", [False, True])
+def test_stalled_headers_and_bodies_have_an_absolute_deadline(body):
+    service, _ = make_service(request_timeout=0.2)
+    with service:
+        host, port = service._httpd.server_address[:2]
+        with socket.create_connection((host, port), timeout=3) as connection:
+            partial = b"GET / HTTP/1.1\r\n"
+            if body:
+                partial = (
+                    f"POST /jobs HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                    f"{'Authorization'}: {'Bearer'} {DEFAULT_TOKEN}\r\n"
+                    "Content-Type: application/json\r\nContent-Length: 99\r\n\r\n{"
+                ).encode()
+            connection.sendall(partial)
+            assert connection.recv(4096) == b""
+
+
+def test_request_workers_are_bounded(monkeypatch):
+    started = threading.Event()
+    setup = rest._Handler.setup
+
+    def record(handler):
+        setup(handler)
+        started.set()
+
+    monkeypatch.setattr(rest._Handler, "setup", record)
+    service, _ = make_service(max_requests=1)
+    with service:
+        host, port = service._httpd.server_address[:2]
+        with socket.create_connection((host, port), timeout=3) as first:
+            first.sendall(b"GET / HTTP/1.1\r\n")
+            assert started.wait(3)
+            with socket.create_connection((host, port), timeout=3) as excess:
+                assert excess.recv(4096) == b""
+
+
+@pytest.mark.parametrize("option, value", [
+    ("timeout", float("nan")), ("request_timeout", float("inf")),
+    ("concurrency", True), ("max_jobs", 0), ("max_result_bytes", 0), ("max_requests", 0),
+])
+def test_service_limits_must_be_positive_and_finite(option, value):
+    with pytest.raises(ValueError, match=option):
+        make_service(**{option: value})
+
+
+def test_cli_defaults_to_public_only_and_forwards_limits(monkeypatch):
+    from camoufox.__main__ import cli
+
+    monkeypatch.setenv(rest.TOKEN_ENV_VAR, DEFAULT_TOKEN)
+    received = {}
+    monkeypatch.setattr(rest, "serve", lambda *args, **kw: received.update(kw))
+    result = CliRunner().invoke(cli, ["rest", "--port", "0"])
+    assert result.exit_code == 0, result.output
+    assert received["allow_private_networks"] is False
+    result = CliRunner().invoke(
+        cli, ["rest", "--allow-private-networks", "--max-result-bytes", "512", "--max-requests", "3"]
+    )
+    assert result.exit_code == 0, result.output
+    assert received["max_result_bytes"] == 512
+    assert received["max_requests"] == 3
+    assert received["allow_private_networks"] is True
 
 
 class FakeElement:
@@ -96,14 +316,6 @@ class FakeContext:
     def __init__(self, browser):
         self.browser = browser
         self.closed = False
-        self.route_handler = None
-        self.listeners = {}
-
-    async def route(self, _pattern, handler):
-        self.route_handler = handler
-
-    def on(self, event, listener):
-        self.listeners[event] = listener
 
     async def new_page(self):
         self.page = FakePage(self)
@@ -156,9 +368,13 @@ class FakeLauncher:
         self.closed = True
 
 
-def request(service, method, path, body=None, token=None, raw=None):
+def request(service, method, path, body=None, token=DEFAULT_TOKEN, raw=None):
     data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
     req = urllib.request.Request(service.url + path, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    if token == DEFAULT_TOKEN:
+        token = service._token
     if token:
         req.add_header("Authorization", "Bearer " + token)
     try:
@@ -168,7 +384,7 @@ def request(service, method, path, body=None, token=None, raw=None):
         return error.code, json.loads(error.read())
 
 
-def wait_finished(service, job_id, token=None):
+def wait_finished(service, job_id, token=DEFAULT_TOKEN):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         _, job = request(service, "GET", f"/jobs/{job_id}", token=token)
@@ -181,7 +397,11 @@ def wait_finished(service, job_id, token=None):
 def make_service(browser=None, **options):
     launcher = FakeLauncher(browser or FakeBrowser())
     options.setdefault("port", 0)
-    return rest.RestService(lambda: launcher, **options), launcher
+    options.setdefault("token", DEFAULT_TOKEN)
+    def launch(**kwargs):
+        launcher.prefs = kwargs.get("firefox_user_prefs", {})
+        return launcher
+    return rest.RestService(launch, **options), launcher
 
 
 def test_content_job_returns_the_page_and_closes_its_context():
@@ -212,9 +432,11 @@ def test_screenshot_job_returns_base64_png():
     [
         ({"url": PUBLIC_URL, "operation": "evaluate"}, None),
         ({"url": "file:///etc/passwd", "operation": "content"}, None),
-        ({"url": "http://127.0.0.1:8080/", "operation": "content"}, None),
-        ({"url": "http://[::ffff:10.0.0.1]/", "operation": "content"}, None),
-        ({"url": "http://169.254.169.254/latest/meta-data/", "operation": "content"}, None),
+        ({"url": "http://127.0.0.1/", "operation": "content"}, None),
+        ({"url": "http://10.0.0.1/", "operation": "content"}, None),
+        ({"url": "http://169.254.169.254/", "operation": "content"}, None),
+        ({"url": "http://[::1]/", "operation": "content"}, None),
+        ({"url": "http://[::ffff:127.0.0.1]/", "operation": "content"}, None),
         ({"url": PUBLIC_URL, "operation": "content", "script": "1"}, None),
         ({"operation": "content"}, None),
         ({"url": PUBLIC_URL, "operation": "content", "wait_until": "never"}, None),
@@ -228,7 +450,6 @@ def test_screenshot_job_returns_base64_png():
         ({"url": PUBLIC_URL, "operation": "content", "os": "android"}, None),
         ({"url": PUBLIC_URL, "operation": "content", "geolocation": {"latitude": 91, "longitude": 0}}, None),
         ({"url": PUBLIC_URL, "operation": "content", "geolocation": {"latitude": 52}}, None),
-        ({"url": PUBLIC_URL, "operation": "content", "proxy": {"server": "http://127.0.0.1:3128"}}, None),
         ({"url": PUBLIC_URL, "operation": "content", "proxy": {"server": "file:///etc/passwd"}}, None),
         ({"url": PUBLIC_URL, "operation": "content", "proxy": {"server": PUBLIC_URL, "bypass": "*"}}, None),
         ({"url": PUBLIC_URL, "operation": "screenshot", "format": "text"}, None),
@@ -305,7 +526,7 @@ def test_identity_options_reach_the_context_and_the_proxy_password_stays_private
         "url": PUBLIC_URL, "operation": "content", "os": "macos", "timezone_id": "Europe/Amsterdam",
         "geolocation": {"latitude": 52.37, "longitude": 4.89}, "proxy": proxy,
     }
-    service, _ = make_service()
+    service, _ = make_service(allow_private_networks=True)
     with service:
         _, plain = request(service, "POST", "/jobs", {"url": PUBLIC_URL, "operation": "content"})
         _, job = request(service, "POST", "/jobs", body)
@@ -372,35 +593,88 @@ def test_a_failing_job_reports_the_error_and_its_context_is_closed():
     assert launcher.browser.contexts[0].closed
 
 
-def test_a_redirect_to_a_private_address_fails_the_job():
-    async def redirect(context, url):
-        context.listeners["request"](FakeRequest("http://10.0.0.1/admin", redirected_from=FakeRequest(url)))
+def test_per_job_proxy_is_rejected_in_public_mode():
+    service, launcher = make_service()
+    with service:
+        status, response = request(service, "POST", "/jobs", {
+            "url": PUBLIC_URL, "operation": "content", "proxy": {"server": PUBLIC_URL},
+        })
+    assert status == 400
+    assert "proxy" in response["error"]
+    assert launcher.browser.contexts == []
 
-    service, launcher = make_service(FakeBrowser(on_goto=redirect))
+
+@pytest.mark.parametrize("kind, target", [
+    ("redirect", "http://10.0.0.1/admin"),
+    ("subresource", "http://169.254.169.254/latest/meta-data/"),
+    ("websocket", "ws://127.0.0.1/socket"),
+    ("websocket", "wss://[::ffff:127.0.0.1]/socket"),
+])
+def test_private_page_requests_use_the_context_gateway(kind, target, context_options):
+    async def page_request(_context, _url):
+        proxy = urlsplit(context_options[-1]["_transport_proxy"]["server"])
+        destination = urlsplit(target)
+        reader, writer = await asyncio.open_connection(proxy.hostname, proxy.port)
+        try:
+            writer.write(b"\x05\x01\x00")
+            await writer.drain()
+            assert await reader.readexactly(2) == b"\x05\x00"
+            host = destination.hostname.encode()
+            port = destination.port or (443 if destination.scheme in ("https", "wss") else 80)
+            writer.write(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + port.to_bytes(2, "big"))
+            await writer.drain()
+            assert (await reader.readexactly(10))[1] != 0
+            if kind == "redirect":
+                raise RuntimeError("redirect connection refused")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    service, launcher = make_service(FakeBrowser(on_goto=page_request))
     with service:
         _, job = request(service, "POST", "/jobs", {"url": PUBLIC_URL, "operation": "content"})
         finished = wait_finished(service, job["id"])
-        status, _ = request(service, "GET", f"/jobs/{job['id']}/result")
-    assert finished["status"] == "failed"
-    assert "10.0.0.1" in finished["error"]
-    assert status == 409
+    assert finished["status"] == ("failed" if kind == "redirect" else "succeeded")
     assert launcher.browser.contexts[0].closed
 
 
-def test_subresources_to_private_addresses_are_aborted():
-    routes = {}
+@pytest.mark.parametrize("options", [
+    {"proxy": {"server": "http://127.0.0.1:8080"}},
+    {"from_options": {"headless": True}},
+    {"persistent_context": True},
+    {"launch_options": {"firefox_user_prefs": {"media.peerconnection.enabled": True}}},
+])
+def test_public_serve_rejects_opaque_or_unrestricted_launch_config(options, monkeypatch):
+    monkeypatch.setattr(rest.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(rest, "AsyncCamoufox", lambda **_kw: pytest.fail("browser launched"))
+    with pytest.raises(ValueError, match="public-only"):
+        rest.serve(launch_options=options)
 
-    async def load_subresources(context, _url):
-        for url in ("http://127.0.0.1/secret", PUBLIC_URL + "style.css"):
-            routes[url] = FakeRoute(url)
-            await context.route_handler(routes[url])
 
-    service, _ = make_service(FakeBrowser(on_goto=load_subresources))
-    with service:
-        _, job = request(service, "POST", "/jobs", {"url": PUBLIC_URL, "operation": "content"})
-        wait_finished(service, job["id"])
-    assert routes["http://127.0.0.1/secret"].outcome == "blockedbyclient"
-    assert routes[PUBLIC_URL + "style.css"].outcome == "continued"
+def test_serve_enforces_security_prefs_over_operator_prefs(monkeypatch):
+    received = {}
+    class Stop(Exception):
+        pass
+
+    def camoufox(**options):
+        received.update(options)
+        raise Stop()
+
+    monkeypatch.setenv(rest.TOKEN_ENV_VAR, DEFAULT_TOKEN)
+    monkeypatch.setattr(rest.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(rest, "AsyncCamoufox", camoufox)
+    with pytest.raises(Stop):
+        rest.serve(port=0, launch_options={
+            "firefox_user_prefs": {
+                "media.peerconnection.enabled": True,
+                "network.proxy.allow_hijacking_localhost": False,
+                "network.proxy.no_proxies_on": "*",
+                "permissions.default.image": 2,
+            },
+        })
+    assert received["firefox_user_prefs"] == {
+        **rest.PUBLIC_ONLY_PREFS, "permissions.default.image": 2,
+    }
 
 
 def test_unknown_jobs_and_paths_are_404():
@@ -453,7 +727,7 @@ def test_shutdown_cancels_running_jobs_and_closes_everything():
 
 def test_a_launch_failure_is_raised_and_nothing_is_left_listening():
     launcher = FakeLauncher(FakeBrowser(), fail=True)
-    service = rest.RestService(lambda: launcher, port=0)
+    service = rest.RestService(lambda: launcher, port=0, token=DEFAULT_TOKEN, allow_private_networks=True)
     with pytest.raises(RuntimeError, match="launch failed"):
         service.__enter__()
     with pytest.raises(OSError):
@@ -463,7 +737,7 @@ def test_a_launch_failure_is_raised_and_nothing_is_left_listening():
 def test_token_is_required_when_configured():
     service, _ = make_service(token="s3cret")
     with service:
-        assert request(service, "POST", "/jobs", {"url": PUBLIC_URL, "operation": "content"})[0] == 401
+        assert request(service, "POST", "/jobs", {"url": PUBLIC_URL, "operation": "content"}, token=None)[0] == 401
         assert request(service, "GET", "/jobs/x", token="wrong")[0] == 401
         status, _ = request(service, "POST", "/jobs", {"url": PUBLIC_URL, "operation": "content"}, token="s3cret")
         assert status == 202
@@ -472,7 +746,8 @@ def test_token_is_required_when_configured():
 def test_binding_beyond_loopback_requires_a_token():
     with pytest.raises(ValueError, match=rest.TOKEN_ENV_VAR):
         rest.RestService(lambda: FakeLauncher(FakeBrowser()), host="0.0.0.0")
-    rest.RestService(lambda: FakeLauncher(FakeBrowser()), host="0.0.0.0", token="s3cret")
+    rest.RestService(lambda: FakeLauncher(FakeBrowser()), host="0.0.0.0", token="s3cret",
+                     allow_private_networks=True)
 
 
 def test_the_web_page_loads_without_a_token_under_a_strict_policy():
@@ -482,6 +757,8 @@ def test_the_web_page_loads_without_a_token_under_a_strict_policy():
             page = response.read()
             headers = response.headers
     assert page == rest.PAGE
+    assert b"Token (required)" in page
+    assert b"-H 'Content-Type: application/json'" in page
     assert headers["Content-Type"] == "text/html; charset=utf-8"
     assert "default-src 'none'" in headers["Content-Security-Policy"]
     assert "connect-src 'self'" in headers["Content-Security-Policy"]
