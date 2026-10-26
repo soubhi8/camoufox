@@ -1,91 +1,83 @@
 """
-Tests for camoufox.addons default-addon download/caching.
+Tests for camoufox.addons: the default addons are the ones the browser bundles.
 
-Regression guard for #308: a partial/failed first download leaves an empty
-addon directory behind. The old "already downloaded" check was a bare
-os.path.exists(dir), so that empty dir was trusted forever and every later
-launch raised InvalidAddonPath ("manifest.json is missing"), unrecoverable
-short of manually deleting the cache.
+Each browser release carries uBlock Origin under addons/UBO/ beside its binary
+(Contents/Resources/addons/UBO/ in a macOS app bundle), put there by
+browser/scripts/fetch-ubo.py when it is packaged. The launcher loads that copy,
+so the uBO a user runs is the one the release was tested with.
 
 Run with:
     cd python && python -m pytest tests/test_addons.py -v
 """
 
-import os
+import warnings
+from pathlib import Path
 
-import pytest
-
-from camoufox import addons as addons_mod
-from camoufox.addons import DefaultAddons, maybe_download_addons
-
-UBO = DefaultAddons.UBO.name
+from camoufox.addons import DefaultAddons, add_default_addons, get_addon_path
 
 
-@pytest.fixture
-def addons_dir(tmp_path, monkeypatch):
-    # Point the addon store at a throwaway dir so no real cache is touched.
-    root = tmp_path / "addons"
-    monkeypatch.setattr(addons_mod, "get_addon_path", lambda name: str(root / name))
-    return root
+def _build(root: Path, *, mac: bool = False, bundled: bool = True) -> Path:
+    """A build's executable, with uBO bundled where packaging puts it."""
+    if mac:
+        binary = root / "Camoufox.app" / "Contents" / "MacOS" / "camoufox"
+        files = root / "Camoufox.app" / "Contents" / "Resources"
+    else:
+        binary, files = root / "camoufox-bin", root
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("")
+    if bundled:
+        (files / "addons" / "UBO").mkdir(parents=True)
+        (files / "addons" / "UBO" / "manifest.json").write_text("{}")
+    return binary
 
 
-def _write_manifest(url, extract_path, name):
-    os.makedirs(extract_path, exist_ok=True)
-    with open(os.path.join(extract_path, "manifest.json"), "w") as f:
-        f.write("{}")
-
-
-def test_partial_dir_is_redownloaded(addons_dir, monkeypatch):
-    # Leftover empty dir from a failed first download.
-    partial = addons_dir / UBO
-    partial.mkdir(parents=True)
-    assert not (partial / "manifest.json").exists()
-
-    calls = []
-
-    def fake(url, extract_path, name):
-        calls.append(name)
-        _write_manifest(url, extract_path, name)
-
-    monkeypatch.setattr(addons_mod, "download_and_extract", fake)
-
+def test_the_bundled_addon_beside_the_binary_is_loaded(tmp_path):
+    binary = _build(tmp_path)
     out = []
-    maybe_download_addons([DefaultAddons.UBO], out)
-
-    # An empty dir must trigger a re-download, not be trusted.
-    assert calls == [UBO]
-    assert (partial / "manifest.json").exists()
-    assert out == [str(partial)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        add_default_addons(out, None, binary)
+    assert out == [str(tmp_path / "addons" / "UBO")]
 
 
-def test_extracted_addon_is_not_redownloaded(addons_dir, monkeypatch):
-    path = addons_dir / UBO
-    path.mkdir(parents=True)
-    (path / "manifest.json").write_text("{}")
-
-    def boom(*a, **k):
-        raise AssertionError("must not re-download an already-extracted addon")
-
-    monkeypatch.setattr(addons_mod, "download_and_extract", boom)
-
+def test_a_mac_app_bundle_keeps_it_in_resources(tmp_path):
+    binary = _build(tmp_path, mac=True)
+    expected = tmp_path / "Camoufox.app" / "Contents" / "Resources" / "addons" / "UBO"
+    assert get_addon_path("UBO", binary) == str(expected)
     out = []
-    maybe_download_addons([DefaultAddons.UBO], out)
-    assert out == [str(path)]
+    add_default_addons(out, None, binary)
+    assert out == [str(expected)]
 
 
-def test_failed_download_removes_partial_dir(addons_dir, monkeypatch):
-    path = addons_dir / UBO
-
-    def fail(url, extract_path, name):
-        os.makedirs(extract_path, exist_ok=True)  # partial write, then die
-        raise RuntimeError("network died mid-download")
-
-    monkeypatch.setattr(addons_mod, "download_and_extract", fail)
-
+def test_an_excluded_addon_is_left_out_without_a_warning(tmp_path):
+    binary = _build(tmp_path, bundled=False)
     out = []
-    maybe_download_addons([DefaultAddons.UBO], out)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        add_default_addons(out, [DefaultAddons.UBO], binary)
+    assert out == []
 
-    # The partial dir must be gone so the next run re-downloads instead of
-    # trusting an addon that has no manifest.json.
-    assert not path.exists()
+
+def test_a_build_without_the_addon_launches_without_it_and_says_so(tmp_path):
+    """An older release or an unpackaged build: not an error, but not silent."""
+    binary = _build(tmp_path, bundled=False)
+    out = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        add_default_addons(out, None, binary)
+    assert out == []
+    assert len(caught) == 1
+    message = str(caught[0].message)
+    assert str(tmp_path / "addons" / "UBO") in message
+    assert "exclude_addons" in message
+
+
+def test_a_partial_directory_does_not_count(tmp_path):
+    """An interrupted staging leaves no manifest.json; that is not an addon."""
+    binary = _build(tmp_path, bundled=False)
+    (tmp_path / "addons" / "UBO").mkdir(parents=True)
+    out = []
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        add_default_addons(out, None, binary)
     assert out == []

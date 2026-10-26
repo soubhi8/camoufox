@@ -38,16 +38,19 @@ GUARD_DIR = REPO_ROOT / "browser" / "tests" / "playwright" / "patches"
 GROUPS: Dict[str, Tuple[str, ...]] = {
     "spoofing": (
         "animation-timing",
-        "audio-frequency-noise",
+        "audio-matches-stock",
         "baseline-protections",
+        "context-app-version",
         "context-lists-across-processes",
         "context-os-system-font",
+        "display-scale-resolution",
         "fingerprint-setter-seal",
         "ipv4-only-network",
         "locale-explicit-names",
         "media-devices-coherence",
         "spoofed-voice-speaks",
         "startup-prefs",
+        "system-font-alias-stall",
         "system-ui-font-spoofing",
         "timezone-stable",
         "touchscreen-digitizer",
@@ -73,11 +76,14 @@ GROUPS: Dict[str, Tuple[str, ...]] = {
         "noop-mousemove-deadlock",
         "occluded-window-active",
         "trusted-events",
+        "ubo-lists-frozen",
         "visible-automation-cues",
     ),
     "parity": (
+        "certificate-revocations",
         "contentaccessible-parity",
         "firefox-version-pin",
+        "getter-cost-parity",
         "gfx-probes-packaged",
         "hardware-acceleration-policy",
         "popup-blocker-parity",
@@ -86,7 +92,9 @@ GROUPS: Dict[str, Tuple[str, ...]] = {
         "stock-gpu-parity",
         "stock-parity-probes",
         "viewport-no-rdm",
+        "windows-crt-math",
         "windows-exe-manifest",
+        "windows-keyboard",
     ),
 }
 
@@ -99,6 +107,30 @@ def gate_name(group: Optional[str]) -> str:
 def guards() -> List[Path]:
     """Every guard script. helpers.py is a library, not a guard."""
     return sorted(p for p in GUARD_DIR.glob("*.py") if p.name != "helpers.py")
+
+
+def leftover_browsers(binary: Path) -> List[str]:
+    """Processes of the browser still running after a guard, with CPU seconds.
+
+    Guards share one runner. A browser a guard failed to close keeps its
+    content processes -- and any spinning workers -- alive into every later
+    guard, which then sees a slower machine than it was written for. On Linux
+    those content processes run plugin-container, which sits beside the binary.
+    """
+    binary = binary.resolve()
+    exes = {str(binary), str(binary.parent / "plugin-container")}
+    ticks = os.sysconf("SC_CLK_TCK")
+    found = []
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            if os.readlink(proc / "exe") not in exes:
+                continue
+            fields = (proc / "stat").read_text().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        cpu = (int(fields[11]) + int(fields[12])) / ticks
+        found.append(f"pid {proc.name} cpu {cpu:.1f}s")
+    return found
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -147,8 +179,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             failed.append(guard.name)
             tail = proc.combined().strip().splitlines()[-6:]
             result.note(f"{guard.name} failed ({proc.code}): " + " | ".join(t.strip() for t in tail))
+            # The note keeps six lines; the job log gets all of it.
+            log(f"  ✗ {guard.name} output:\n{proc.combined().strip()}")
         else:
             log(f"  ✓ {guard.name}")
+        leftovers = leftover_browsers(binary)
+        if leftovers:
+            log(f"  {guard.name} left {len(leftovers)} browser processes running: {', '.join(leftovers)}",
+                level="WARN")
 
     passed = len(selected) - len(failed)
     result.note(f"{passed}/{len(selected)} guards passed")

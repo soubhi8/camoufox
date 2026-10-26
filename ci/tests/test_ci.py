@@ -634,7 +634,7 @@ def test_a_deployment_without_score_mode_is_flagged_not_silent():
 
 
 def _cross(**kw):
-    base = {"total": 3, "uniqueAudio": 3, "uniqueCanvas": 3, "uniqueFonts": 3,
+    base = {"total": 3, "uniqueAudio": 1, "uniqueCanvas": 3, "uniqueFonts": 3,
             "uniqueTimezones": 3, "uniqueScreens": 3, "uniqueVoices": 3,
             "uniqueWebGL": 3, "uniquePlatforms": 1}
     base.update(kw)
@@ -642,16 +642,27 @@ def _cross(**kw):
 
 
 def test_a_shared_per_context_value_is_a_leak():
-    """audio and timezone are derived per context.
+    """The timezone is derived per context.
 
     Two contexts sharing one is the failure this whole suite exists to catch.
     """
     from ci.run_build_tester import uniqueness
 
-    for slot in ("uniqueAudio", "uniqueTimezones"):
-        out = uniqueness(_cross(**{slot: 1}))
-        assert out["leaks"] == [f"macPerContext.{slot} (1/3 distinct)"], slot
-        assert not out["noise"]
+    out = uniqueness(_cross(uniqueTimezones=1))
+    assert out["leaks"] == ["macPerContext.uniqueTimezones (1/3 distinct)"]
+    assert not out["noise"]
+
+
+def test_audio_that_varies_between_contexts_is_noise_on_the_render():
+    """Stock renders one audio value per CPU architecture, so contexts on one
+    host must agree (ci/tribal-rules.yml: audio-is-not-noised). Agreement is
+    correct; a second value means something noised the render."""
+    from ci.run_build_tester import uniqueness
+
+    assert not uniqueness(_cross())["not_constant"]
+    out = uniqueness(_cross(uniqueAudio=3))
+    assert out["not_constant"] == ["macPerContext.uniqueAudio (3/3 distinct)"]
+    assert not out["leaks"]
 
 
 def test_a_shared_canvas_is_noise_not_a_leak():
@@ -2802,6 +2813,71 @@ def test_build_tester_accepts_every_core_count_pythonlib_presents():
 
 
 # ---------------------------------------------------------------------------
+# packaging
+# ---------------------------------------------------------------------------
+
+
+def _package_module():
+    """browser/scripts/package.py, imported the way it runs (its directory on sys.path)."""
+    import importlib.util
+    import sys
+
+    scripts = CI_ROOT.parent / "browser" / "scripts"
+    sys.path.insert(0, str(scripts))
+    try:
+        spec = importlib.util.spec_from_file_location("camoufox_package", scripts / "package.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path.remove(str(scripts))
+
+
+def test_packaged_font_names_are_ascii(tmp_path, monkeypatch):
+    """A plain `unzip` must extract the release zip in any locale.
+
+    The font bundle carries macOS faces named in Japanese (Hiragino). The zip
+    stores those names correctly as UTF-8, but unzip 6.0 under a C/POSIX locale
+    -- a Docker build, a bare SSH shell -- reports every one as a mismatching
+    local filename and exits 1, which stops a consumer's `set -e` install.
+    """
+    import shlex
+
+    package = _package_module()
+    monkeypatch.chdir(tmp_path)
+    group = tmp_path / "bundle" / "fonts" / "M"
+    group.mkdir(parents=True)
+    (group.parent / "groups.json").write_text('{"readBy": {"mac": ["M"]}}')
+    (group / "18__ヒラギノ角ゴシック W9.ttc").write_bytes(b"w9")
+    (group / "21__ヒラギノ角ゴシック W1.ttc").write_bytes(b"w1")
+    (group / "07__Helvetica.ttc").write_bytes(b"h")
+
+    # Stand in for 7z: the extracted package is empty, and what would be
+    # zipped is read back from the staging directory.
+    packaged = []
+
+    def fake_run(cmd, exit_on_fail=True):
+        args = shlex.split(cmd)
+        if args[:2] == ["7z", "u"]:
+            fonts = pathlib.Path(args[3].removesuffix("/*"), "fonts")
+            packaged.append({p.name: p.read_bytes() for p in fonts.iterdir()})
+
+    monkeypatch.setattr(package, "run", fake_run)
+    monkeypatch.setattr(package, "inject_locales", lambda *args: None)
+    for _ in range(2):
+        (tmp_path / "in.zip").write_bytes(b"")
+        package.add_includes_to_package("in.zip", [], ["macos"], "out.zip", "windows", "158.0", "")
+
+    names = sorted(packaged[0])
+    assert all(name.isascii() for name in names), names
+    assert packaged[0].pop("07__Helvetica.ttc") == b"h"
+    assert all(n.startswith(("18__", "21__")) and n.endswith(".ttc") for n in packaged[0]), names
+    assert sorted(packaged[0].values()) == [b"w1", b"w9"]
+    # Deterministic: the same bundle packages to the same names.
+    assert sorted(packaged[1]) == names
+
+
+# ---------------------------------------------------------------------------
 # build-or-fetch: the published release is used only when it matches the tree
 # ---------------------------------------------------------------------------
 
@@ -2976,6 +3052,26 @@ def test_the_patch_guard_matrix_runs_every_group():
 
     legs = {leg["leg"] for leg in _jobs()["patch-guards"]["strategy"]["matrix"]["include"]}
     assert legs == set(GROUPS) | {"skiplist"}
+
+
+def test_leftover_browsers_sees_content_processes(tmp_path):
+    """Firefox's Linux content processes run plugin-container, beside the binary."""
+    import shutil
+    import subprocess
+
+    from ci.run_patch_guards import leftover_browsers
+
+    # A shell blocked on its builtin read: coreutils may be one binary that
+    # picks its command from argv[0], which a copy named plugin-container loses.
+    child = tmp_path / "plugin-container"
+    shutil.copy2(shutil.which("sh"), child)
+    proc = subprocess.Popen([child, "-c", "read line"], stdin=subprocess.PIPE)
+    try:
+        found = leftover_browsers(tmp_path / "camoufox-bin")
+    finally:
+        proc.kill()
+        proc.wait()
+    assert [f.split()[1] for f in found] == [str(proc.pid)]
 
 
 # ---------------------------------------------------------------------------
