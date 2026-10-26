@@ -219,6 +219,7 @@ async def AsyncNewContext(
     webrtc_ip: Optional[str] = None,
     proxy: Optional[Dict[str, str]] = None,
     geolocation: Optional[Dict[str, float]] = None,
+    _transport_proxy: Optional[Dict[str, str]] = None,
     **context_kwargs: Any,
 ) -> BrowserContext:
     """
@@ -242,6 +243,8 @@ async def AsyncNewContext(
         geolocation: Per-context geolocation ({"latitude": float, "longitude": float}).
         **context_kwargs: Additional Playwright new_context() options.
     """
+    if proxy and _transport_proxy:
+        raise ValueError("identity and transport proxies cannot be combined")
     # The drawn UA carries fpgen's Firefox version, which must not disagree with
     # the browser the page is actually talking to.
     ff_version = ff_version or browser.version.split('.', 1)[0]
@@ -260,6 +263,9 @@ async def AsyncNewContext(
         ),
     )
 
-    context = await browser.new_context(**new_context_options(fp, context_kwargs, proxy, geolocation))
+    # REST's local security gateway is transport, not a new geographic identity.
+    context = await browser.new_context(
+        **new_context_options(fp, context_kwargs, _transport_proxy or proxy, geolocation)
+    )
     await context.add_init_script(fp['init_script'])
     return context

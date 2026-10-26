@@ -928,32 +928,53 @@ def server():
     "--max-jobs", default=100, show_default=True, type=click.IntRange(min=1), help="Job records kept in memory"
 )
 @click.option(
+    "--max-result-bytes", default=4 * 1024 * 1024, show_default=True, type=click.IntRange(min=1),
+    help="Maximum serialized JSON bytes retained per result (including base64 images)",
+)
+@click.option(
+    "--max-requests", default=16, show_default=True, type=click.IntRange(min=1),
+    help="Maximum concurrent HTTP request workers; excess connections are closed",
+)
+@click.option(
     "--timeout", default=30.0, show_default=True, type=click.FloatRange(min=0, min_open=True),
     help="Seconds a running job may take, and the most a job may ask for",
 )
 @click.option(
     "--allow-private-networks", is_flag=True,
-    help="Allow jobs to reach loopback, private and other non-public addresses",
+    help="Allow trusted jobs and per-job proxies unrestricted access, including private networks",
+)
+@click.option(
+    "--trusted-authority", "trusted_authorities", multiple=True, metavar="HOST:PORT",
+    help="Advertised HTTP authority to accept; may be repeated",
 )
 @click.option(
     "--launch-options", default="{}", metavar="JSON", callback=lambda _ctx, _param, value: _json_object(value),
     help='Camoufox launch options for the shared browser, e.g. \'{"humanize": true, "block_images": true}\'',
 )
-def rest(host, port, concurrency, max_jobs, timeout, allow_private_networks, launch_options):
+def rest(
+    host, port, concurrency, max_jobs, max_result_bytes, max_requests, timeout,
+    allow_private_networks, trusted_authorities, launch_options,
+):
     """
-    Launch a REST API that runs page jobs
+    Launch a public-only REST API for page jobs. CAMOUFOX_REST_TOKEN is required on every bind.
     """
     from .rest import serve
 
-    serve(
-        host,
-        port,
-        concurrency=concurrency,
-        max_jobs=max_jobs,
-        timeout=timeout,
-        allow_private_networks=allow_private_networks,
-        launch_options=launch_options,
-    )
+    try:
+        serve(
+            host,
+            port,
+            concurrency=concurrency,
+            max_jobs=max_jobs,
+            max_result_bytes=max_result_bytes,
+            max_requests=max_requests,
+            timeout=timeout,
+            allow_private_networks=allow_private_networks,
+            trusted_authorities=trusted_authorities,
+            launch_options=launch_options,
+        )
+    except (ValueError, RuntimeError) as error:
+        raise click.ClickException(str(error)) from error
 
 
 def _json_object(value):

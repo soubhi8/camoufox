@@ -12,8 +12,8 @@ not reachable over HTTP. `GET /` serves a small web page for the same API,
 import asyncio
 import base64
 import hmac
-import ipaddress
 import json
+import math
 import os
 import signal
 import socket
@@ -21,14 +21,16 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, AsyncContextManager, Callable, Dict, Optional, Tuple
+from typing import Any, AsyncContextManager, Callable, Dict, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
 
-from playwright.async_api import Browser, BrowserContext, Request, Route
+from playwright.async_api import Browser, BrowserContext
 
+from ._rest_proxy import InvalidDestination, PublicGateway, resolve_public
 from .async_api import AsyncCamoufox, AsyncNewContext
 
 OPERATIONS = ('content', 'screenshot')
@@ -37,7 +39,23 @@ TOKEN_ENV_VAR = 'CAMOUFOX_REST_TOKEN'
 MAX_BODY_BYTES = 16 * 1024
 MAX_URL_LENGTH = 2048
 MAX_SELECTOR_LENGTH = 1024
+MAX_RESULT_BYTES = 4 * 1024 * 1024
+MAX_ERROR_BYTES = 1024
+MAX_REQUESTS = 16
+REQUEST_TIMEOUT = 10.0
 PROXY_SCHEMES = ('http', 'https', 'socks5')
+# REST-only: close non-TCP transports and Firefox's built-in loopback proxy exemption.
+PUBLIC_ONLY_PREFS = {
+    'media.peerconnection.enabled': False,
+    'network.proxy.allow_hijacking_localhost': True,
+    'network.proxy.no_proxies_on': '',
+    'network.proxy.socks_remote_dns': True,
+    'network.dns.disablePrefetch': True,
+    'network.prefetch-next': False,
+    'network.http.speculative-parallel-limit': 0,
+    'network.http.http3.enable': False,
+    'network.webtransport.enabled': False,
+}
 PAGE = (Path(__file__).parent / 'rest.html').read_bytes()
 # The page renders job results, so it may reach only this service and show only inline images.
 PAGE_CSP = (
@@ -81,7 +99,7 @@ class InvalidJob(ValueError):
 
 
 class BlockedURL(InvalidJob):
-    """The URL is not http(s), or points at a non-public address."""
+    """The URL does not use an allowed scheme or has no hostname."""
 
 
 class JobStoreFull(RuntimeError):
@@ -89,26 +107,20 @@ class JobStoreFull(RuntimeError):
 
 
 async def check_url(url: str, allow_private_networks: bool, schemes: Tuple[str, ...] = ('http', 'https')) -> None:
-    """Raise BlockedURL unless `url` has one of `schemes` and, by default, resolves only to public addresses."""
+    """Reject bad submissions early; the gateway separately pins actual connections."""
     try:
         parts = urlsplit(url)
         host = parts.hostname
+        port = parts.port or (443 if parts.scheme == 'https' else 80)
     except ValueError as error:
         raise BlockedURL(f"{url!r} is not a valid URL: {error}") from error
     if parts.scheme not in schemes or not host:
         raise BlockedURL(f"{url!r} is not a {'/'.join(schemes)} URL")
-    if allow_private_networks:
-        return
-    try:
-        infos = await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    except socket.gaierror as error:
-        raise BlockedURL(f"cannot resolve {host!r}: {error}") from error
-    for *_, sockaddr in infos:
-        address = ipaddress.ip_address(sockaddr[0].split('%', 1)[0])
-        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
-            address = address.ipv4_mapped
-        if not address.is_global:
-            raise BlockedURL(f"{host!r} resolves to the non-public address {address}")
+    if not allow_private_networks:
+        try:
+            await asyncio.wait_for(resolve_public(host, port), REQUEST_TIMEOUT)
+        except (InvalidDestination, asyncio.TimeoutError) as error:
+            raise BlockedURL(f"blocked URL {url!r}: {error}") from error
 
 
 def job_schema(max_timeout: float) -> Dict[str, Any]:
@@ -175,7 +187,7 @@ def job_schema(max_timeout: float) -> Dict[str, Any]:
             'proxy': {
                 'type': 'object', 'required': ['server'], 'additionalProperties': False,
                 'description': 'A proxy for this job only. The fingerprint\'s WebRTC IP and timezone follow its '
-                'exit IP. The password is never shown in the job\'s status.',
+                'exit IP. Requires --allow-private-networks. The password is never shown in the job\'s status.',
                 'properties': {
                     'server': {
                         'type': 'string', 'minLength': 1, 'maxLength': MAX_URL_LENGTH,
@@ -220,7 +232,8 @@ def _check(name: str, value: Any, rule: Dict[str, Any]) -> None:
         low = rule.get('minimum', rule.get('exclusiveMinimum'))
         if (
             isinstance(value, bool) or not isinstance(value, (int, float))
-            or value < low or value > rule['maximum'] or ('exclusiveMinimum' in rule and value == low)
+            or value < low or value > rule['maximum'] or not math.isfinite(value)
+            or ('exclusiveMinimum' in rule and value == low)
         ):
             bound = 'above' if 'exclusiveMinimum' in rule else 'at least'
             raise InvalidJob(f"{name} must be a number {bound} {low:g} and at most {rule['maximum']:g}")
@@ -278,7 +291,10 @@ def openapi(max_timeout: float, token_required: bool) -> Dict[str, Any]:
         'info': {
             'title': 'Camoufox REST API',
             'version': '1',
-            'description': 'Submit a page job, poll its status, then fetch its result.',
+            'description': (
+                'Public-only page jobs through a DNS-pinned TCP gateway by default. Submit a job, '
+                'poll its status, then fetch its bounded result.'
+            ),
         },
         'paths': {
             '/jobs': {'post': {
@@ -287,6 +303,9 @@ def openapi(max_timeout: float, token_required: bool) -> Dict[str, Any]:
                 'responses': responses({
                     '202': ('The job, queued.', job),
                     '400': ('The body is invalid, or the URL is blocked.', error),
+                    '403': ('The browser Origin does not match the listener.', error),
+                    '413': ('The submission exceeds the body limit.', error),
+                    '415': ('Content-Type must be application/json.', error),
                     '503': ('Every job slot holds an unfinished job; retry later.', error),
                 }),
             }},
@@ -343,18 +362,22 @@ class JobRunner:
         max_jobs: int,
         timeout: float,
         allow_private_networks: bool,
+        max_result_bytes: int = MAX_RESULT_BYTES,
     ) -> None:
         self._browser = browser
         self._slots = asyncio.Semaphore(concurrency)
         self._max_jobs = max_jobs
         self._timeout = timeout
         self._allow_private_networks = allow_private_networks
+        self._max_result_bytes = max_result_bytes
         self._jobs: Dict[str, Job] = {}
 
     async def submit(self, body: Any) -> Dict[str, Any]:
         params = parse_job(body, self._timeout)
         await check_url(params['url'], self._allow_private_networks)
         if params['proxy']:
+            if not self._allow_private_networks:
+                raise InvalidJob('per-job proxy requires --allow-private-networks')
             await check_url(params['proxy']['server'], self._allow_private_networks, PROXY_SCHEMES)
 
         if len(self._jobs) >= self._max_jobs:
@@ -399,30 +422,30 @@ class JobRunner:
             job.status, job.error = 'failed', f"timed out after {job.params['timeout']:g}s ({waited})"
         except Exception as error:
             job.status, job.error = 'failed', f"{type(error).__name__}: {error}"
+        finally:
+            if job.error:
+                job.error = job.error.encode('utf-8', errors='replace')[
+                    :min(MAX_ERROR_BYTES, self._max_result_bytes)
+                ].decode(
+                    'utf-8', errors='ignore'
+                )
+            job.task = None
 
     async def _execute(self, job: Job) -> Dict[str, Any]:
         # The context is created outside the timeout so a timeout can never
         # orphan a context that was still being created.
         options = {name: job.params[name] for name in ('os', 'timezone_id', 'geolocation', 'proxy')}
-        context = await AsyncNewContext(self._browser, **{name: value for name, value in options.items() if value})
-        try:
-            return await asyncio.wait_for(self._operate(context, job.params), job.params['timeout'])
-        finally:
-            await context.close()
+        async with AsyncExitStack() as stack:
+            if not self._allow_private_networks:
+                gateway = await stack.enter_async_context(PublicGateway())
+                options['_transport_proxy'] = {'server': f'socks5://127.0.0.1:{gateway.port}'}
+            context = await AsyncNewContext(self._browser, **{name: value for name, value in options.items() if value})
+            try:
+                return await asyncio.wait_for(self._operate(context, job.params), job.params['timeout'])
+            finally:
+                await context.close()
 
     async def _operate(self, context: BrowserContext, params: Dict[str, Any]) -> Dict[str, Any]:
-        redirects = []
-
-        def record_redirect(request: Request) -> None:
-            if request.redirected_from:
-                redirects.append(request.url)
-
-        if not self._allow_private_networks:
-            await context.route('**/*', self._guard)
-            # Playwright does not route redirect hops, so check them afterwards
-            # and refuse to return anything a redirect fetched.
-            context.on('request', record_redirect)
-
         page = await context.new_page()
         # The job's own timeout bounds every step, rather than Playwright's 30s default.
         page.set_default_timeout(0)
@@ -442,26 +465,28 @@ class JobRunner:
             image = await (element.screenshot() if element else page.screenshot(full_page=params['full_page']))
             result['screenshot'] = base64.b64encode(image).decode()
 
-        for url in redirects:
-            await check_url(url, allow_private_networks=False)
+        if len(json.dumps(result).encode()) > self._max_result_bytes:
+            raise InvalidJob(f"result exceeds {self._max_result_bytes} bytes")
         return result
 
-    async def _guard(self, route: Route) -> None:
-        try:
-            await check_url(route.request.url, allow_private_networks=False)
-        except BlockedURL:
-            await route.abort('blockedbyclient')
-            return
-        await route.continue_()
 
-
-def _is_loopback(host: str) -> bool:
-    if host == 'localhost':
-        return True
+def _authority_key(authority: str, *, require_port: bool = False) -> Tuple[str, int]:
+    if not isinstance(authority, str):
+        raise ValueError(f"invalid authority {authority!r}")
     try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
+        parsed = urlsplit('http://' + authority)
+        host = parsed.hostname
+        port = parsed.port
+        if (
+            not authority or any(char.isspace() for char in authority)
+            or parsed.username is not None or parsed.password is not None
+            or parsed.netloc != authority or parsed.path or parsed.query or parsed.fragment or not host
+            or (require_port and port is None) or port == 0
+        ):
+            raise ValueError("invalid authority")
+    except ValueError as error:
+        raise ValueError(f"invalid authority {authority!r}") from error
+    return host.lower(), port if port is not None else 80
 
 
 class RestService:
@@ -471,11 +496,15 @@ class RestService:
     Use as a context manager. Entering binds the port and launches the browser;
     exiting stops accepting requests, cancels unfinished jobs and closes the
     browser.
+
+    In public-only mode, `launcher` must accept `firefox_user_prefs` and forward
+    them unchanged to a fresh AsyncCamoufox browser. It must not supply a
+    persistent context, an existing browser, or a launch-level proxy.
     """
 
     def __init__(
         self,
-        launcher: Callable[[], AsyncContextManager[Browser]],
+        launcher: Callable[..., AsyncContextManager[Browser]],
         *,
         host: str = '127.0.0.1',
         port: int = 8000,
@@ -484,23 +513,45 @@ class RestService:
         max_jobs: int = 100,
         timeout: float = 30.0,
         allow_private_networks: bool = False,
+        max_result_bytes: int = MAX_RESULT_BYTES,
+        max_requests: int = MAX_REQUESTS,
+        request_timeout: float = REQUEST_TIMEOUT,
+        trusted_authorities: Sequence[str] = (),
     ) -> None:
-        if not token and not _is_loopback(host):
+        if (
+            not isinstance(token, str) or not token
+            or any(not 33 <= ord(char) <= 126 for char in token)
+        ):
             raise ValueError(
-                f"Refusing to serve on {host!r} without a token. Set {TOKEN_ENV_VAR}, "
-                "or bind to 127.0.0.1."
+                f"Refusing to serve on {host!r} without an explicit printable ASCII token "
+                f"(no whitespace). Set {TOKEN_ENV_VAR}."
             )
-        if concurrency < 1 or max_jobs < 1 or timeout <= 0:
-            raise ValueError("concurrency, max_jobs and timeout must all be positive")
+        for name, value in (
+            ('concurrency', concurrency), ('max_jobs', max_jobs),
+            ('max_result_bytes', max_result_bytes), ('max_requests', max_requests),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        for name, value in (('timeout', timeout), ('request_timeout', request_timeout)):
+            if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
         self._launcher = launcher
         self._address = (host, port)
+        if isinstance(trusted_authorities, str):
+            raise ValueError("trusted_authorities must be a sequence of host:port authorities")
+        self._trusted_authorities: Set[Tuple[str, int]] = {
+            _authority_key(authority, require_port=True) for authority in trusted_authorities
+        }
         self._token = token
+        self.max_requests = max_requests
+        self.request_timeout = request_timeout
         self.openapi = openapi(timeout, token_required=bool(token))
         self._runner_options = dict(
             concurrency=concurrency,
             max_jobs=max_jobs,
             timeout=timeout,
             allow_private_networks=allow_private_networks,
+            max_result_bytes=max_result_bytes,
         )
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
@@ -513,12 +564,11 @@ class RestService:
     def url(self) -> str:
         assert self._httpd is not None
         host, port = self._httpd.server_address[:2]
-        return f"http://{host}:{port}"
+        return f"http://{'[' + host + ']' if ':' in host else host}:{port}"
 
     def authorizes(self, authorization: str) -> bool:
         """Whether an Authorization header value grants access."""
-        if not self._token:
-            return True
+        assert self._token is not None
         return hmac.compare_digest(authorization.encode(), ('Bearer ' + self._token).encode())
 
     def call(self, coro: Any) -> Any:
@@ -555,7 +605,9 @@ class RestService:
             self._loop.close()
 
     async def _open(self) -> JobRunner:
-        self._browser_cm = self._launcher()
+        # Custom public-only launchers must forward these prefs to a fresh Camoufox.
+        prefs = {} if self._runner_options['allow_private_networks'] else PUBLIC_ONLY_PREFS
+        self._browser_cm = self._launcher(**({'firefox_user_prefs': dict(prefs)} if prefs else {}))
         browser = await self._browser_cm.__aenter__()
         return JobRunner(browser, **self._runner_options)
 
@@ -574,25 +626,124 @@ class _HTTPServer(ThreadingHTTPServer):
 
     def __init__(self, address: Any, service: RestService) -> None:
         self.service = service
+        self._requests = threading.BoundedSemaphore(service.max_requests)
+        if ':' in address[0]:
+            self.address_family = socket.AF_INET6
         super().__init__(address, _Handler)
+
+    def process_request(self, request: socket.socket, client_address: Any) -> None:
+        if not self._requests.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._requests.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._requests.release()
 
 
 class _Handler(BaseHTTPRequestHandler):
     server: _HTTPServer
+
+    def setup(self) -> None:
+        self.request.settimeout(self.server.service.request_timeout)
+        super().setup()
+        # A socket inactivity timeout alone lets a slow sender retain a worker forever.
+        self._deadline = threading.Timer(
+            self.server.service.request_timeout, self._expire
+        )
+        self._deadline.daemon = True
+        self._deadline.start()
+
+    def _expire(self) -> None:
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def finish(self) -> None:
+        self._deadline.cancel()
+        super().finish()
+
+    def parse_request(self) -> bool:
+        if not super().parse_request():
+            return False
+        self.close_connection = True
+        if self.headers.defects or any(
+            self.headers.get_all(name)
+            for name in ('Forwarded', 'X-Forwarded-Host', 'X-Forwarded-Proto', 'X-Forwarded-Port')
+        ):
+            self._send(400, {'error': 'untrusted request headers'})
+            return False
+        for name in ('Host', 'Origin', 'Authorization', 'Content-Length', 'Content-Type'):
+            if len(self.headers.get_all(name, [])) > 1:
+                self._send(400, {'error': f"duplicate {name}"})
+                return False
+        if self.headers.get_all('Transfer-Encoding') or self.headers.get_all('Expect'):
+            self._send(400, {'error': 'unsupported request framing'})
+            return False
+        try:
+            authority = self.headers.get('Host', '')
+            request_authority = _authority_key(authority)
+            bound_host, bound_port = self.connection.getsockname()[:2]
+            allowed = {(bound_host.lower(), bound_port)}
+            configured = self.server.service._address[0].lower()
+            if configured not in ('0.0.0.0', '::'):
+                allowed.add((configured, bound_port))
+            if (
+                request_authority not in allowed
+                and request_authority not in self.server.service._trusted_authorities
+            ):
+                raise ValueError("untrusted Host")
+        except ValueError:
+            self._send(400, {'error': 'Host must match this listener or a trusted authority'})
+            return False
+        origin = self.headers.get('Origin')
+        if origin is not None and origin != 'http://' + authority:
+            self._send(403, {'error': 'Origin must match this listener'})
+            return False
+        if not self.path.startswith('/') or self.path.startswith('//'):
+            self._send(400, {'error': 'request target must be relative to this listener'})
+            return False
+        try:
+            urlsplit(self.path)
+        except ValueError:
+            self._send(400, {'error': 'invalid request target'})
+            return False
+        return True
+
+    def handle_expect_100(self) -> bool:
+        self._send(400, {'error': 'Expect is unsupported'})
+        return False
 
     def do_POST(self) -> None:
         if not self._authorized():
             return
         if urlsplit(self.path).path != '/jobs':
             return self._send(404, {'error': 'not found'})
-        try:
-            length = int(self.headers.get('Content-Length', ''))
-        except ValueError:
+        if self.headers.get_content_type() != 'application/json':
+            return self._send(415, {'error': 'Content-Type must be application/json'})
+        raw_length = self.headers.get('Content-Length')
+        if raw_length is None:
             return self._send(411, {'error': 'Content-Length is required'})
-        if not 0 <= length <= MAX_BODY_BYTES:
+        if not raw_length.isascii() or not raw_length.isdecimal():
+            return self._send(400, {'error': 'invalid Content-Length'})
+        if len(raw_length) > len(str(MAX_BODY_BYTES)):
+            return self._send(413, {'error': f"body must be at most {MAX_BODY_BYTES} bytes"})
+        length = int(raw_length)
+        if length > MAX_BODY_BYTES:
             return self._send(413, {'error': f"body must be at most {MAX_BODY_BYTES} bytes"})
         try:
-            body = json.loads(self.rfile.read(length))
+            data = self.rfile.read(length)
+            if len(data) != length:
+                return self._send(400, {'error': 'incomplete body'})
+            body = json.loads(data)
         except ValueError:
             return self._send(400, {'error': 'body is not valid JSON'})
 
@@ -601,7 +752,7 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             job = service.call(service.jobs.submit(body))
         except InvalidJob as error:
-            return self._send(400, {'error': str(error)})
+            return self._send(400, {'error': str(error)[:MAX_ERROR_BYTES]})
         except JobStoreFull as error:
             return self._send(503, {'error': str(error)})
         self._send(202, job)
@@ -667,7 +818,10 @@ def serve(
     max_jobs: int = 100,
     timeout: float = 30.0,
     allow_private_networks: bool = False,
+    max_result_bytes: int = MAX_RESULT_BYTES,
+    max_requests: int = MAX_REQUESTS,
     launch_options: Optional[Dict[str, Any]] = None,
+    trusted_authorities: Sequence[str] = (),
 ) -> None:
     """
     Run the REST API on a headless Camoufox until interrupted or terminated.
@@ -677,8 +831,21 @@ def serve(
     """
     # SIGTERM (e.g. `docker stop`) unwinds like Ctrl-C, so the browser is closed.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    options = {'headless': True, **(launch_options or {})}
+    if not allow_private_networks and any(
+        options.get(key) for key in ('proxy', 'from_options', 'persistent_context', 'launch_options')
+    ):
+        raise ValueError(
+            'public-only REST requires a fresh non-persistent browser without a launch proxy, '
+            'from_options or nested launch_options'
+        )
+
+    def launcher(**required: Any) -> AsyncContextManager[Browser]:
+        prefs = {**(options.get('firefox_user_prefs') or {}), **required.get('firefox_user_prefs', {})}
+        return AsyncCamoufox(**{**options, 'firefox_user_prefs': prefs})
+
     with RestService(
-        lambda: AsyncCamoufox(**{'headless': True, **(launch_options or {})}),
+        launcher,
         host=host,
         port=port,
         token=os.environ.get(TOKEN_ENV_VAR) or None,
@@ -686,6 +853,9 @@ def serve(
         max_jobs=max_jobs,
         timeout=timeout,
         allow_private_networks=allow_private_networks,
+        max_result_bytes=max_result_bytes,
+        max_requests=max_requests,
+        trusted_authorities=trusted_authorities,
     ) as service:
         print(f"Camoufox REST API listening on {service.url}", flush=True)
         try:

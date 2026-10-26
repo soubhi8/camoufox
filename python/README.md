@@ -334,39 +334,126 @@ passed to Playwright's `firefox.launch()` (or `launch_persistent_context()`).
 | `path` | | Print the data directory (`~/.cache/camoufox` on Linux). |
 | `test [URL]` | `--executable-path PATH` | Open a headed browser with the Playwright inspector. |
 | `server` | | Start a Playwright server with default options and print its websocket endpoint. |
-| `rest` | `--host`, `--port`, `--concurrency`, `--max-jobs`, `--timeout`, `--allow-private-networks`, `--launch-options` | Run page jobs over HTTP in isolated browser contexts. |
+| `rest` | `--host`, `--port`, `--concurrency`, `--max-jobs`, `--max-result-bytes`, `--max-requests`, `--timeout`, `--allow-private-networks`, `--trusted-authority`, `--launch-options` | Run public-only page jobs over HTTP in separate browser contexts. |
 | `gpu-setup [GPU]` | | Print the root script that sets this machine up for `headless="virtual-gpu"` on the card `GPU` names (or `CAMOUFOX_GPU`). Run it with `\| sudo sh`. |
 | `gpu-xorg-config [GPU]` | | Print the Xorg config `headless="virtual-gpu"` needs for the card `GPU` names (or `CAMOUFOX_GPU`). |
 
 ### REST API
 
-Start the service on loopback. Each job gets a fresh browser context and
-fingerprint; `/` provides a web client and `/docs` describes the API.
+**Jobs have public-only TCP egress by default.** Each context uses its own
+loopback SOCKS5 gateway for navigation, redirects, subresources and `ws`/`wss`.
+For every connection the gateway resolves once, rejects the entire answer if
+any address is non-public, and connects a socket to a validated numeric address
+without resolving again. IPv4-mapped IPv6 addresses are checked as IPv4.
+The REST browser enables Firefox's localhost proxying, clears proxy bypasses and disables WebRTC,
+HTTP/3 and WebTransport so page traffic cannot bypass the gateway over UDP.
+DNS prefetching and speculative connections are also disabled. These are
+REST-only launch preferences, not changes to the browser defaults.
+DNS preflight is only early input validation, not the security boundary.
+
+Only opt into `--allow-private-networks` for trusted jobs: this deliberately
+allows the browser and per-job proxies to access loopback, private networks and
+metadata endpoints, including through redirects and page scripts. A token
+authenticates callers, not remote pages. Run behind an independently enforced
+egress firewall or network namespace when loading untrusted pages; browser
+contexts isolate storage, not the host's network or process resources.
+
+Every bind, including loopback, requires an explicitly configured
+`CAMOUFOX_REST_TOKEN` (printable ASCII without whitespace). No token is
+generated or printed:
 
 ```bash
+export CAMOUFOX_REST_TOKEN=$(openssl rand -hex 32)
 camoufox rest --port 8000 --concurrency 2 --timeout 30
+```
+
+In another terminal with the same token exported:
+
+```bash
 id=$(curl -s -X POST http://127.0.0.1:8000/jobs \
+  --oauth2-bearer "$CAMOUFOX_REST_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://example.com","operation":"content"}' | jq -r .id)
-curl -s "http://127.0.0.1:8000/jobs/$id/result"
+while status=$(curl -s --oauth2-bearer "$CAMOUFOX_REST_TOKEN" \
+  "http://127.0.0.1:8000/jobs/$id" | jq -r .status); do
+  case "$status" in succeeded|failed) break;; esac
+  sleep 0.2
+done
+curl -s --oauth2-bearer "$CAMOUFOX_REST_TOKEN" \
+  "http://127.0.0.1:8000/jobs/$id/result"
 ```
 
 Jobs support `content` (HTML or rendered text) and `screenshot`, with optional
-selectors, navigation waits, timeouts, and per-job identity or proxy settings.
-The service rejects non-public destinations by default. Binding beyond
-loopback requires `CAMOUFOX_REST_TOKEN`; use `--allow-private-networks` only
-when that access is intended. `--launch-options` configures the shared browser
-and is available only to the service operator.
+selectors, navigation waits, timeouts, and per-job identity settings. Per-job
+proxies require `--allow-private-networks`: a remote proxy's DNS and connections
+cannot be constrained by the local gateway.
+`--launch-options` configures the shared browser and is available only to the
+service operator. Public-only mode rejects `proxy`, `from_options`,
+`persistent_context` and nested SDK `launch_options`, and enforces its required Firefox
+preferences even if launch options try to override them.
+
+The same token and public-only defaults apply to Python `RestService`.
+A custom launcher must accept the `firefox_user_prefs` keyword argument and
+forward it unchanged to a fresh `AsyncCamoufox` browser. It must not return an
+existing browser or persistent context, or configure a launch-level proxy.
+A launcher that cannot accept the required preferences fails at startup:
+
+```python
+import os
+from camoufox.async_api import AsyncCamoufox
+from camoufox.rest import RestService
+
+def launcher(*, firefox_user_prefs):
+    return AsyncCamoufox(headless=True, firefox_user_prefs=firefox_user_prefs)
+
+with RestService(launcher, token=os.environ["CAMOUFOX_REST_TOKEN"]) as service:
+    input(f"Listening on {service.url}; press Enter to stop\n")
+```
+
+The launcher contract and gateway protect page egress on the shipped Camoufox;
+they are not a sandbox for an arbitrary browser binary or a malicious launcher.
+
+`/`, `/docs` and `/openapi.json` contain no job data and load without a token.
+API requests require one bearer header; submissions also require
+`Content-Type: application/json`, a single `Content-Length`, and at most 16 KiB
+of body data. Every request requires one `Host` naming the configured bind
+host or the concrete local listener IP, with the listener's port. For wildcard
+binds behind Docker port mappings or a reverse proxy, configure each advertised
+`HOST:PORT` with `--trusted-authority`; wildcard binds do not trust arbitrary
+hostnames. Browser `Origin`, when present, must exactly equal `http://` plus
+`Host`. Forwarded authority headers and ambiguous framing are rejected; a
+reverse proxy must enforce its own external authentication.
+
+`--max-jobs` bounds retained job records; a finished job is evicted when space
+is needed. `--max-result-bytes` defaults to 4 MiB per serialized JSON result,
+including URL, title, escaped HTML/text and base64 PNG. Oversized results fail
+without being retained; stored errors are capped at the smaller of 1 KiB and
+that limit. Retained result bytes are bounded by
+`max_jobs * max_result_bytes`; browser memory and transient result extraction
+are not covered by this bound. `--max-requests` defaults to 16 request workers;
+excess connections are closed. Headers, body reads and response writes have
+a 10-second absolute connection deadline. The Python API additionally exposes
+`request_timeout` to configure that deadline.
+Each running job has at most 32 gateway connections, including handshakes;
+excess connections are closed. DNS and connection attempts share a 10-second
+handshake deadline; after connection, 10 seconds without traffic in either
+direction or a blocked write closes the relay. The gateway streams bounded
+chunks and closes every socket when its job's context closes, including on
+cancellation.
 
 Build the Docker image from the Python package directory. The container binds
-to all interfaces and therefore requires a token:
+to all interfaces and keeps public-only egress by default:
 
 ```bash
 docker build -t camoufox-rest python
 export CAMOUFOX_REST_TOKEN=$(openssl rand -hex 16)
 docker run --rm --shm-size=1g -p 127.0.0.1:8000:8000 \
-  -e CAMOUFOX_REST_TOKEN camoufox-rest
+  -e CAMOUFOX_REST_TOKEN camoufox-rest --trusted-authority 127.0.0.1:8000
 ```
+
+For a different published port, configure that advertised authority instead,
+for example `-p 127.0.0.1:9000:8000` with
+`--trusted-authority 127.0.0.1:9000`.
 
 `set` and `fetch` read builds from these repositories (`repos.yml`):
 
