@@ -61,12 +61,13 @@ class PublicGateway:
         self._closing = True
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
         tasks = list(self._tasks)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
+        if self._server:
+            await self._server.wait_closed()
 
     def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         if self._closing or len(self._tasks) >= self.max_connections:
@@ -186,5 +187,7 @@ class PublicGateway:
             tasks = [*pumps, *([watchdog] if watchdog is not None else [])]
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await self._close_streams(upstream, writer)
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                await self._close_streams(upstream, writer)

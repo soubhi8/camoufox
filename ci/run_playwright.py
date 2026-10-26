@@ -165,7 +165,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         result.finish(results.ERROR).save(args.results_dir)
         return 1
 
-    env = {"CAMOUFOX_EXECUTABLE_PATH": str(binary.resolve())}
+    env = {
+        "CAMOUFOX_EXECUTABLE_PATH": str(binary.resolve()),
+        "CAMOUFOX_REPO_ROOT": str(REPO_ROOT),
+    }
 
     versions = resolve(
         browser_version=args.browser_version, playwright_tag=args.playwright_tag

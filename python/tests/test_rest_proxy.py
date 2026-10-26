@@ -245,6 +245,21 @@ def test_connection_limit_timeout_and_shutdown():
     asyncio.run(run())
 
 
+def test_gateway_cancels_handlers_before_waiting_for_server_shutdown():
+    async def run():
+        gateway = _rest_proxy.PublicGateway()
+        await gateway.__aenter__()
+        reader, writer = await asyncio.open_connection("127.0.0.1", gateway.port)
+        assert gateway._tasks
+        await asyncio.wait_for(gateway.__aexit__(None, None, None), 1)
+        assert not gateway._tasks
+        assert await reader.read() == b""
+        writer.close()
+        await writer.wait_closed()
+
+    asyncio.run(run())
+
+
 def test_active_response_stream_outlives_the_idle_timeout(monkeypatch):
     async def run():
         async def stream(reader, writer):
