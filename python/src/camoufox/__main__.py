@@ -905,10 +905,17 @@ def server():
     help="Allow trusted jobs and per-job proxies unrestricted access, including private networks",
 )
 @click.option(
+    "--trusted-authority", "trusted_authorities", multiple=True, metavar="HOST:PORT",
+    help="Advertised HTTP authority to accept; may be repeated",
+)
+@click.option(
     "--launch-options", default="{}", metavar="JSON", callback=lambda _ctx, _param, value: _json_object(value),
     help='Camoufox launch options for the shared browser, e.g. \'{"humanize": true, "block_images": true}\'',
 )
-def rest(host, port, concurrency, max_jobs, max_result_bytes, max_requests, timeout, allow_private_networks, launch_options):
+def rest(
+    host, port, concurrency, max_jobs, max_result_bytes, max_requests, timeout,
+    allow_private_networks, trusted_authorities, launch_options,
+):
     """
     Launch a public-only REST API for page jobs. CAMOUFOX_REST_TOKEN is required on every bind.
     """
@@ -924,6 +931,7 @@ def rest(host, port, concurrency, max_jobs, max_result_bytes, max_requests, time
             max_requests=max_requests,
             timeout=timeout,
             allow_private_networks=allow_private_networks,
+            trusted_authorities=trusted_authorities,
             launch_options=launch_options,
         )
     except (ValueError, RuntimeError) as error:

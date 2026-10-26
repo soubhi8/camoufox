@@ -197,6 +197,26 @@ def test_wildcard_bind_accepts_only_the_actual_local_ip():
             assert b" 400 " in connection.recv(4096)
 
 
+def test_wildcard_bind_accepts_the_documented_docker_authority():
+    service, _ = make_service(host="0.0.0.0", trusted_authorities=("127.0.0.1:8000",))
+    with service:
+        host, port = service._httpd.server_address[:2]
+        with socket.create_connection((host, port), timeout=3) as connection:
+            connection.sendall(
+                b"GET / HTTP/1.1\r\n"
+                b"Host: 127.0.0.1:8000\r\n"
+                b"Origin: http://127.0.0.1:8000\r\n\r\n"
+            )
+            assert b" 200 " in connection.recv(4096)
+        with socket.create_connection((host, port), timeout=3) as connection:
+            connection.sendall(
+                b"GET / HTTP/1.1\r\n"
+                b"Host: 127.0.0.1:8000\r\n"
+                b"Origin: http://evil.example\r\n\r\n"
+            )
+            assert b" 403 " in connection.recv(4096)
+
+
 @pytest.mark.parametrize("body", [False, True])
 def test_stalled_headers_and_bodies_have_an_absolute_deadline(body):
     service, _ = make_service(request_timeout=0.2)
@@ -252,12 +272,16 @@ def test_cli_defaults_to_public_only_and_forwards_limits(monkeypatch):
     assert result.exit_code == 0, result.output
     assert received["allow_private_networks"] is False
     result = CliRunner().invoke(
-        cli, ["rest", "--allow-private-networks", "--max-result-bytes", "512", "--max-requests", "3"]
+        cli, [
+            "rest", "--allow-private-networks", "--max-result-bytes", "512",
+            "--max-requests", "3", "--trusted-authority", "127.0.0.1:8000",
+        ]
     )
     assert result.exit_code == 0, result.output
     assert received["max_result_bytes"] == 512
     assert received["max_requests"] == 3
     assert received["allow_private_networks"] is True
+    assert received["trusted_authorities"] == ("127.0.0.1:8000",)
 
 
 class FakeElement:

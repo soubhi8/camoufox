@@ -87,6 +87,58 @@ def test_rebinding_after_a_public_preflight_is_refused_before_connect(monkeypatc
     asyncio.run(run())
 
 
+def test_connection_attempts_share_the_overall_deadline(monkeypatch):
+    async def run():
+        async def echo(reader, writer):
+            try:
+                writer.write(await reader.read(4096))
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        server = await asyncio.start_server(echo, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        loop = asyncio.get_running_loop()
+        real_connect = loop.sock_connect
+        real_getaddrinfo = loop.getaddrinfo
+        attempts = []
+
+        async def resolve(host, requested_port, **kwargs):
+            if host == "127.0.0.1":
+                return await real_getaddrinfo(host, requested_port, **kwargs)
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))
+                for ip in ("93.184.215.14", "1.1.1.1")
+            ]
+
+        async def pinned(sock, address):
+            if address == ("127.0.0.1", gateway.port):
+                return await real_connect(sock, address)
+            attempts.append(address[0])
+            if address[0] == "93.184.215.14":
+                await asyncio.Event().wait()
+            await real_connect(sock, ("127.0.0.1", port))
+
+        monkeypatch.setattr(loop, "getaddrinfo", resolve)
+        monkeypatch.setattr(loop, "sock_connect", pinned)
+        try:
+            async with _rest_proxy.PublicGateway(timeout=0.4) as gateway:
+                reader, writer, reply = await connect(gateway, "multiple.example", port)
+                assert reply[1] == 0
+                writer.write(b"hello")
+                await writer.drain()
+                assert await asyncio.wait_for(reader.readexactly(5), 1) == b"hello"
+                writer.close()
+                await writer.wait_closed()
+            assert attempts == ["93.184.215.14", "1.1.1.1"]
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("payload", [
     b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
     b"GET /redirect-to-private HTTP/1.1\r\n\r\n",
@@ -190,6 +242,77 @@ def test_connection_limit_timeout_and_shutdown():
         assert not gateway._tasks
         with pytest.raises(OSError):
             await asyncio.open_connection("127.0.0.1", gateway.port)
+    asyncio.run(run())
+
+
+def test_active_response_stream_outlives_the_idle_timeout(monkeypatch):
+    async def run():
+        async def stream(reader, writer):
+            await reader.read(4096)
+            for chunk in b"stream":
+                writer.write(bytes([chunk]))
+                await writer.drain()
+                await asyncio.sleep(0.06)
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_server(stream, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        loop = asyncio.get_running_loop()
+        real_connect = loop.sock_connect
+        real_getaddrinfo = loop.getaddrinfo
+
+        async def resolve(host, requested_port, **kwargs):
+            if host == "example.com":
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", requested_port))]
+            return await real_getaddrinfo(host, requested_port, **kwargs)
+
+        async def pinned(sock, address):
+            if address == ("93.184.215.14", port):
+                return await real_connect(sock, ("127.0.0.1", port))
+            return await real_connect(sock, address)
+
+        monkeypatch.setattr(loop, "getaddrinfo", resolve)
+        monkeypatch.setattr(loop, "sock_connect", pinned)
+        try:
+            async with _rest_proxy.PublicGateway(timeout=0.1) as gateway:
+                reader, writer, reply = await connect(gateway, "example.com", port)
+                assert reply[1] == 0
+                writer.write(b"request")
+                await writer.drain()
+                assert await asyncio.wait_for(reader.readexactly(6), 1) == b"stream"
+                writer.close()
+                await writer.wait_closed()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_stream_shutdown_aborts_transports_that_do_not_close():
+    async def run():
+        class Transport:
+            aborted = False
+
+            def abort(self):
+                self.aborted = True
+
+        class Stream:
+            def __init__(self):
+                self.transport = Transport()
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+            async def wait_closed(self):
+                await asyncio.Event().wait()
+
+        streams = (Stream(), Stream())
+        await _rest_proxy.PublicGateway(timeout=0.01)._close_streams(*streams)
+        assert all(stream.closed and stream.transport.aborted for stream in streams)
+
     asyncio.run(run())
 
 

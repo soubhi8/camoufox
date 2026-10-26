@@ -6,6 +6,8 @@ import socket
 import struct
 from typing import Any, List, Optional, Set, Tuple
 
+CLOSE_TIMEOUT = 1.0
+
 
 class InvalidDestination(ValueError):
     """A destination has no exclusively public TCP addresses."""
@@ -107,7 +109,9 @@ class PublicGateway:
             sock.setblocking(False)
             try:
                 # sockaddr contains a validated numeric address, never the original hostname.
-                await loop.sock_connect(sock, sockaddr)
+                await asyncio.wait_for(
+                    loop.sock_connect(sock, sockaddr), self.timeout * 0.8 / len(answers)
+                )
                 return await asyncio.open_connection(sock=sock, limit=65536)
             except OSError:
                 sock.close()
@@ -116,17 +120,49 @@ class PublicGateway:
                 raise
         raise OSError("all public destination addresses failed")
 
-    async def _pump(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _pump(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+        activity: asyncio.Event, last_activity: List[float],
+    ) -> None:
         while True:
-            data = await asyncio.wait_for(reader.read(65536), self.timeout)
+            data = await reader.read(65536)
             if not data:
                 return
+            activity.set()
+            last_activity[0] = asyncio.get_running_loop().time()
             writer.write(data)
             await asyncio.wait_for(writer.drain(), self.timeout)
+
+    async def _wait_for_idle(self, activity: asyncio.Event, last_activity: List[float]) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            remaining = self.timeout - (loop.time() - last_activity[0])
+            if remaining <= 0:
+                return
+            activity.clear()
+            try:
+                await asyncio.wait_for(activity.wait(), remaining)
+            except asyncio.TimeoutError:
+                if loop.time() - last_activity[0] >= self.timeout:
+                    return
+
+    async def _close_streams(self, *streams: Optional[asyncio.StreamWriter]) -> None:
+        streams = tuple(stream for stream in streams if stream is not None)
+        for stream in streams:
+            stream.close()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(stream.wait_closed() for stream in streams), return_exceptions=True),
+                min(self.timeout, CLOSE_TIMEOUT),
+            )
+        except asyncio.TimeoutError:
+            for stream in streams:
+                stream.transport.abort()
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         upstream = None
         pumps: List[asyncio.Task] = []
+        watchdog = None
         try:
             remote = await asyncio.wait_for(self._open(reader, writer), self.timeout)
             if remote is None:
@@ -134,23 +170,21 @@ class PublicGateway:
             remote_reader, upstream = remote
             writer.write(b"\x05\x00\x00\x01" + b"\x00" * 6)
             await asyncio.wait_for(writer.drain(), self.timeout)
+            activity = asyncio.Event()
+            last_activity = [asyncio.get_running_loop().time()]
             pumps = [
-                asyncio.create_task(self._pump(reader, upstream)),
-                asyncio.create_task(self._pump(remote_reader, writer)),
+                asyncio.create_task(self._pump(reader, upstream, activity, last_activity)),
+                asyncio.create_task(self._pump(remote_reader, writer, activity, last_activity)),
             ]
-            await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
+            watchdog = asyncio.create_task(self._wait_for_idle(activity, last_activity))
+            await asyncio.wait([*pumps, watchdog], return_when=asyncio.FIRST_COMPLETED)
         except (asyncio.TimeoutError, asyncio.IncompleteReadError):
             pass
         except (OSError, ValueError, UnicodeError):
             writer.write(b"\x05\x02\x00\x01" + b"\x00" * 6)
         finally:
-            for task in pumps:
+            tasks = [*pumps, *([watchdog] if watchdog is not None else [])]
+            for task in tasks:
                 task.cancel()
-            await asyncio.gather(*pumps, return_exceptions=True)
-            for stream in (upstream, writer):
-                if stream:
-                    stream.close()
-                    try:
-                        await stream.wait_closed()
-                    except OSError:
-                        pass
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await self._close_streams(upstream, writer)

@@ -25,7 +25,7 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, AsyncContextManager, Callable, Dict, Optional, Tuple
+from typing import Any, AsyncContextManager, Callable, Dict, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
 
 from playwright.async_api import Browser, BrowserContext
@@ -470,6 +470,25 @@ class JobRunner:
         return result
 
 
+def _authority_key(authority: str, *, require_port: bool = False) -> Tuple[str, int]:
+    if not isinstance(authority, str):
+        raise ValueError(f"invalid authority {authority!r}")
+    try:
+        parsed = urlsplit('http://' + authority)
+        host = parsed.hostname
+        port = parsed.port
+        if (
+            not authority or any(char.isspace() for char in authority)
+            or parsed.username is not None or parsed.password is not None
+            or parsed.netloc != authority or parsed.path or parsed.query or parsed.fragment or not host
+            or (require_port and port is None) or port == 0
+        ):
+            raise ValueError("invalid authority")
+    except ValueError as error:
+        raise ValueError(f"invalid authority {authority!r}") from error
+    return host.lower(), port if port is not None else 80
+
+
 class RestService:
     """
     The REST API: an HTTP server plus the event loop that owns the browser.
@@ -497,6 +516,7 @@ class RestService:
         max_result_bytes: int = MAX_RESULT_BYTES,
         max_requests: int = MAX_REQUESTS,
         request_timeout: float = REQUEST_TIMEOUT,
+        trusted_authorities: Sequence[str] = (),
     ) -> None:
         if (
             not isinstance(token, str) or not token
@@ -517,6 +537,11 @@ class RestService:
                 raise ValueError(f"{name} must be finite and positive")
         self._launcher = launcher
         self._address = (host, port)
+        if isinstance(trusted_authorities, str):
+            raise ValueError("trusted_authorities must be a sequence of host:port authorities")
+        self._trusted_authorities: Set[Tuple[str, int]] = {
+            _authority_key(authority, require_port=True) for authority in trusted_authorities
+        }
         self._token = token
         self.max_requests = max_requests
         self.request_timeout = request_timeout
@@ -663,26 +688,21 @@ class _Handler(BaseHTTPRequestHandler):
         if self.headers.get_all('Transfer-Encoding') or self.headers.get_all('Expect'):
             self._send(400, {'error': 'unsupported request framing'})
             return False
-        authority = self.headers.get('Host', '')
         try:
-            parsed = urlsplit('http://' + authority)
-            host = parsed.hostname
-            port = parsed.port if parsed.port is not None else 80
-            if (
-                not authority or any(char.isspace() for char in authority)
-                or parsed.username is not None or parsed.password is not None
-                or parsed.path or parsed.query or parsed.fragment or not host
-            ):
-                raise ValueError("invalid Host")
+            authority = self.headers.get('Host', '')
+            request_authority = _authority_key(authority)
             bound_host, bound_port = self.connection.getsockname()[:2]
-            allowed = {bound_host.lower()}
+            allowed = {(bound_host.lower(), bound_port)}
             configured = self.server.service._address[0].lower()
             if configured not in ('0.0.0.0', '::'):
-                allowed.add(configured)
-            if host.lower() not in allowed or port != bound_port:
+                allowed.add((configured, bound_port))
+            if (
+                request_authority not in allowed
+                and request_authority not in self.server.service._trusted_authorities
+            ):
                 raise ValueError("untrusted Host")
         except ValueError:
-            self._send(400, {'error': 'Host must match this listener'})
+            self._send(400, {'error': 'Host must match this listener or a trusted authority'})
             return False
         origin = self.headers.get('Origin')
         if origin is not None and origin != 'http://' + authority:
@@ -801,6 +821,7 @@ def serve(
     max_result_bytes: int = MAX_RESULT_BYTES,
     max_requests: int = MAX_REQUESTS,
     launch_options: Optional[Dict[str, Any]] = None,
+    trusted_authorities: Sequence[str] = (),
 ) -> None:
     """
     Run the REST API on a headless Camoufox until interrupted or terminated.
@@ -834,6 +855,7 @@ def serve(
         allow_private_networks=allow_private_networks,
         max_result_bytes=max_result_bytes,
         max_requests=max_requests,
+        trusted_authorities=trusted_authorities,
     ) as service:
         print(f"Camoufox REST API listening on {service.url}", flush=True)
         try:

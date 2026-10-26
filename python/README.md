@@ -321,7 +321,7 @@ passed to Playwright's `firefox.launch()` (or `launch_persistent_context()`).
 | `path` | | Print the data directory (`~/.cache/camoufox` on Linux). |
 | `test [URL]` | `--executable-path PATH` | Open a headed browser with the Playwright inspector. |
 | `server` | | Start a Playwright server with default options and print its websocket endpoint. |
-| `rest` | `--host`, `--port`, `--concurrency`, `--max-jobs`, `--max-result-bytes`, `--max-requests`, `--timeout`, `--allow-private-networks`, `--launch-options` | Run public-only page jobs over HTTP in separate browser contexts. |
+| `rest` | `--host`, `--port`, `--concurrency`, `--max-jobs`, `--max-result-bytes`, `--max-requests`, `--timeout`, `--allow-private-networks`, `--trusted-authority`, `--launch-options` | Run public-only page jobs over HTTP in separate browser contexts. |
 | `gpu-setup [GPU]` | | Print the root script that sets this machine up for `headless="virtual-gpu"` on the card `GPU` names (or `CAMOUFOX_GPU`). Run it with `\| sudo sh`. |
 | `gpu-xorg-config [GPU]` | | Print the Xorg config `headless="virtual-gpu"` needs for the card `GPU` names (or `CAMOUFOX_GPU`). |
 
@@ -404,11 +404,12 @@ they are not a sandbox for an arbitrary browser binary or a malicious launcher.
 API requests require one bearer header; submissions also require
 `Content-Type: application/json`, a single `Content-Length`, and at most 16 KiB
 of body data. Every request requires one `Host` naming the configured bind
-host or the concrete local listener IP, with the listener's port. Wildcard
-binds accept only that concrete IP, never arbitrary hostnames. Browser
-`Origin`, when present, must exactly equal `http://` plus `Host`. Forwarded
-authority headers and ambiguous framing are rejected; a reverse proxy must
-preserve the listener's authority and enforce its own external authentication.
+host or the concrete local listener IP, with the listener's port. For wildcard
+binds behind Docker port mappings or a reverse proxy, configure each advertised
+`HOST:PORT` with `--trusted-authority`; wildcard binds do not trust arbitrary
+hostnames. Browser `Origin`, when present, must exactly equal `http://` plus
+`Host`. Forwarded authority headers and ambiguous framing are rejected; a
+reverse proxy must enforce its own external authentication.
 
 `--max-jobs` bounds retained job records; a finished job is evicted when space
 is needed. `--max-result-bytes` defaults to 4 MiB per serialized JSON result,
@@ -421,9 +422,11 @@ excess connections are closed. Headers, body reads and response writes have
 a 10-second absolute connection deadline. The Python API additionally exposes
 `request_timeout` to configure that deadline.
 Each running job has at most 32 gateway connections, including handshakes;
-excess connections are closed. Handshake/DNS/connect and idle reads/writes
-have 10-second timeouts. The gateway streams bounded chunks and closes every
-socket when its job's context closes, including on cancellation.
+excess connections are closed. DNS and connection attempts share a 10-second
+handshake deadline; after connection, 10 seconds without traffic in either
+direction or a blocked write closes the relay. The gateway streams bounded
+chunks and closes every socket when its job's context closes, including on
+cancellation.
 
 Build the Docker image from the Python package directory. The container binds
 to all interfaces and keeps public-only egress by default:
@@ -432,8 +435,12 @@ to all interfaces and keeps public-only egress by default:
 docker build -t camoufox-rest python
 export CAMOUFOX_REST_TOKEN=$(openssl rand -hex 16)
 docker run --rm --shm-size=1g -p 127.0.0.1:8000:8000 \
-  -e CAMOUFOX_REST_TOKEN camoufox-rest
+  -e CAMOUFOX_REST_TOKEN camoufox-rest --trusted-authority 127.0.0.1:8000
 ```
+
+For a different published port, configure that advertised authority instead,
+for example `-p 127.0.0.1:9000:8000` with
+`--trusted-authority 127.0.0.1:9000`.
 
 `set` and `fetch` read builds from these repositories (`repos.yml`):
 
