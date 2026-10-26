@@ -113,7 +113,7 @@ class PublicGateway:
                     loop.sock_connect(sock, sockaddr), self.timeout * 0.8 / len(answers)
                 )
                 return await asyncio.open_connection(sock=sock, limit=65536)
-            except OSError:
+            except (OSError, asyncio.TimeoutError):
                 sock.close()
             except BaseException:
                 sock.close()
