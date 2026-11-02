@@ -259,19 +259,16 @@ def _markdown_links(text: str, links: Sequence[Dict[str, str]]) -> str:
     output = []
     offset = 0
     for link in links:
-        label = link['text'].strip()
-        if not label:
+        start = text.find(link['start'], offset)
+        end = text.find(link['end'], start + len(link['start']))
+        if start < 0 or end < 0:
             continue
-        pattern = re.compile(r'\s+'.join(re.escape(part) for part in re.split(r'\s+', label)))
-        match = pattern.search(text, offset)
-        if not match:
-            continue
-        output.append(text[offset:match.start()])
-        rendered_label = match.group()
+        output.append(text[offset:start])
+        rendered_label = re.sub(r'\n(?:[ \t]*\n)+', '\n', link['text'].strip())
         rendered_label = re.sub(r'([\\[\]])', r'\\\1', rendered_label)
         href = link['href'].replace('\\', '%5C').replace('<', '%3C').replace('>', '%3E')
         output.append(f'[{rendered_label}](<{href}>)')
-        offset = match.end()
+        offset = end + len(link['end'])
     output.append(text[offset:])
     return ''.join(output)
 
@@ -486,15 +483,43 @@ class JobRunner:
         if params['format'] == 'text':
             root = element if element else page.locator('body')
             content = await root.evaluate(
-                """root => ({
-                    text: root.innerText,
-                    links: [
+                """root => {
+                    const links = [
                         ...(root.matches('a[href]') ? [root] : []),
                         ...root.querySelectorAll('a[href]')
-                    ]
-                        .filter(link => link.getClientRects().length && link.innerText.trim())
-                        .map(link => ({text: link.innerText, href: link.href}))
-                })"""
+                    ].filter(link =>
+                        link.namespaceURI === 'http://www.w3.org/1999/xhtml' &&
+                        link.getClientRects().length && link.innerText.trim()
+                    );
+                    let text = root.innerText;
+                    let marker = '\\uE000camoufox-link\\uE001';
+                    while (text.includes(marker)) marker += '\\uE000';
+                    const markedLinks = links.map((link, index) => ({
+                        element: link,
+                        text: link.innerText,
+                        href: link.href,
+                        start: `${marker}${index}s`,
+                        end: `${marker}${index}e`
+                    }));
+                    try {
+                        for (const link of markedLinks) {
+                            link.startNode = document.createTextNode(link.start);
+                            link.endNode = document.createTextNode(link.end);
+                            link.element.insertBefore(link.startNode, link.element.firstChild);
+                            link.element.appendChild(link.endNode);
+                        }
+                        text = root.innerText;
+                    } finally {
+                        for (const link of markedLinks) {
+                            link.startNode?.remove();
+                            link.endNode?.remove();
+                        }
+                    }
+                    return {
+                        text,
+                        links: markedLinks.map(({text, href, start, end}) => ({text, href, start, end}))
+                    };
+                }"""
             )
             result['text'] = _markdown_links(content['text'], content['links'])
         elif not screenshot:

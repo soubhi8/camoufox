@@ -293,9 +293,15 @@ class FakeElement:
         if expression == "e => e.outerHTML":
             return "<div>element</div>"
         text = "element" if self.selector == "#main" else "example"
+        start, end = "link-start", "link-end"
         return {
-            "text": text,
-            "links": [{"text": text, "href": "https://example.com/listing"}],
+            "text": f"{start}{text}{end}",
+            "links": [{
+                "text": text,
+                "href": "https://example.com/listing",
+                "start": start,
+                "end": end,
+            }],
         }
 
     async def screenshot(self):
@@ -557,10 +563,21 @@ def test_content_as_text_preserves_links_as_markdown(selector, expected):
 
 
 def test_markdown_links_preserve_multiline_anchor_text():
-    text = "Listing title\nDescription\nAnother title"
+    first_start, first_end = "first-start", "first-end"
+    second_start, second_end = "second-start", "second-end"
+    text = (
+        f"{first_start}Listing title\n\nDescription{first_end}\n"
+        f"{second_start}Another title{second_end}"
+    )
     links = [
-        {"text": "Listing title\nDescription", "href": "https://example.com/first"},
-        {"text": "Another title", "href": "https://example.com/second"},
+        {
+            "text": "Listing title\n\nDescription", "href": "https://example.com/first",
+            "start": first_start, "end": first_end,
+        },
+        {
+            "text": "Another title", "href": "https://example.com/second",
+            "start": second_start, "end": second_end,
+        },
     ]
     assert rest._markdown_links(text, links) == (
         "[Listing title\nDescription](<https://example.com/first>)\n"
@@ -568,12 +585,31 @@ def test_markdown_links_preserve_multiline_anchor_text():
     )
 
 
+def test_markdown_links_do_not_match_an_identical_non_link_label():
+    start, end = "anchor-start", "anchor-end"
+    links = [{
+        "text": "Home", "href": "https://example.com/home", "start": start, "end": end,
+    }]
+    assert rest._markdown_links(f"Home{start}Home{end}", links) == (
+        "Home[Home](<https://example.com/home>)"
+    )
+
+
 def test_markdown_links_match_repeated_labels_in_document_order():
+    first_start, first_end = "first-start", "first-end"
+    second_start, second_end = "second-start", "second-end"
     links = [
-        {"text": "read more", "href": "https://example.com/first"},
-        {"text": "read more", "href": "https://example.com/second"},
+        {
+            "text": "read more", "href": "https://example.com/first",
+            "start": first_start, "end": first_end,
+        },
+        {
+            "text": "read more", "href": "https://example.com/second",
+            "start": second_start, "end": second_end,
+        },
     ]
-    assert rest._markdown_links("read more, then read more", links) == (
+    text = f"{first_start}read more{first_end}, then {second_start}read more{second_end}"
+    assert rest._markdown_links(text, links) == (
         "[read more](<https://example.com/first>), then "
         "[read more](<https://example.com/second>)"
     )
