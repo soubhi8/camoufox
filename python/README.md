@@ -383,8 +383,9 @@ curl -s --oauth2-bearer "$CAMOUFOX_REST_TOKEN" \
   "http://127.0.0.1:8000/jobs/$id/result"
 ```
 
-Jobs support `content` (HTML or rendered text) and `screenshot`, with optional
-selectors, navigation waits, timeouts, and per-job identity settings. Per-job
+Jobs support `content` (HTML or rendered text, with hyperlinks formatted as
+Markdown in text mode) and `screenshot`, with optional selectors, navigation
+waits, timeouts, and per-job identity settings. Per-job
 proxies require `--allow-private-networks`: a remote proxy's DNS and connections
 cannot be constrained by the local gateway.
 `--launch-options` configures the shared browser and is available only to the
