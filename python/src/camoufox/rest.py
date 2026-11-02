@@ -15,6 +15,7 @@ import hmac
 import json
 import math
 import os
+import re
 import signal
 import socket
 import sys
@@ -157,8 +158,8 @@ def job_schema(max_timeout: float) -> Dict[str, Any]:
             'format': {
                 'type': 'string', 'enum': ['html', 'text'], 'default': 'html',
                 'description': (
-                    'What `content` returns: `html`, the markup, or `text`, the text a reader sees '
-                    '(its `innerText`), without tags, scripts or styles. Content only.'
+                    'What `content` returns: `html`, the markup, or `text`, the rendered text '
+                    'without tags, scripts or styles, with hyperlinks formatted as Markdown. Content only.'
                 ),
             },
             'full_page': {
@@ -253,6 +254,28 @@ def parse_job(body: Any, max_timeout: float) -> Dict[str, Any]:
     return {**defaults, 'selector': None, 'os': None, 'timezone_id': None, 'geolocation': None, 'proxy': None, **body}
 
 
+def _markdown_links(text: str, links: Sequence[Dict[str, str]]) -> str:
+    """Keep rendered anchor destinations when converting page text to Markdown."""
+    output = []
+    offset = 0
+    for link in links:
+        label = link['text'].strip()
+        if not label:
+            continue
+        pattern = re.compile(r'\s+'.join(re.escape(part) for part in re.split(r'\s+', label)))
+        match = pattern.search(text, offset)
+        if not match:
+            continue
+        output.append(text[offset:match.start()])
+        rendered_label = match.group()
+        rendered_label = re.sub(r'([\\[\]])', r'\\\1', rendered_label)
+        href = link['href'].replace('\\', '%5C').replace('<', '%3C').replace('>', '%3E')
+        output.append(f'[{rendered_label}](<{href}>)')
+        offset = match.end()
+    output.append(text[offset:])
+    return ''.join(output)
+
+
 def openapi(max_timeout: float, token_required: bool) -> Dict[str, Any]:
     """The OpenAPI description of this service, served at /openapi.json."""
     error = {'type': 'object', 'properties': {'error': {'type': 'string'}}}
@@ -271,7 +294,10 @@ def openapi(max_timeout: float, token_required: bool) -> Dict[str, Any]:
             'url': {'type': 'string', 'description': 'The final URL, after redirects.'},
             'title': {'type': 'string'},
             'html': {'type': 'string', 'description': '`content` with `format` html.'},
-            'text': {'type': 'string', 'description': '`content` with `format` text.'},
+            'text': {
+                'type': 'string',
+                'description': '`content` with `format` text; rendered text with hyperlinks formatted as Markdown.',
+            },
             'screenshot': {'type': 'string', 'contentEncoding': 'base64', 'description': '`screenshot` only: a PNG.'},
         },
     }
@@ -458,7 +484,19 @@ class JobRunner:
             )
         result: Dict[str, Any] = {'url': page.url, 'title': await page.title()}
         if params['format'] == 'text':
-            result['text'] = await (element.inner_text() if element else page.inner_text('body'))
+            root = element if element else page.locator('body')
+            content = await root.evaluate(
+                """root => ({
+                    text: root.innerText,
+                    links: [
+                        ...(root.matches('a[href]') ? [root] : []),
+                        ...root.querySelectorAll('a[href]')
+                    ]
+                        .filter(link => link.getClientRects().length && link.innerText.trim())
+                        .map(link => ({text: link.innerText, href: link.href}))
+                })"""
+            )
+            result['text'] = _markdown_links(content['text'], content['links'])
         elif not screenshot:
             result['html'] = await (element.evaluate('e => e.outerHTML') if element else page.content())
         else:

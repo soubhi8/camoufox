@@ -290,8 +290,13 @@ class FakeElement:
         self.state = state
 
     async def evaluate(self, expression):
-        assert expression == "e => e.outerHTML"
-        return "<div>element</div>"
+        if expression == "e => e.outerHTML":
+            return "<div>element</div>"
+        text = "element" if self.selector == "#main" else "example"
+        return {
+            "text": text,
+            "links": [{"text": text, "href": "https://example.com/listing"}],
+        }
 
     async def screenshot(self):
         return b"\x89PNG element"
@@ -320,6 +325,10 @@ class FakePage:
     async def wait_for_selector(self, selector, state):
         self.element = FakeElement(selector, state)
         return self.element
+
+    def locator(self, selector):
+        assert selector == "body"
+        return FakeElement(selector, "attached")
 
     async def title(self):
         return "Example"
@@ -531,7 +540,7 @@ def test_a_selector_waits_for_and_returns_only_that_element(operation, state, fi
 
 
 @pytest.mark.parametrize("selector, expected", [(None, "example"), ("#main", "element")])
-def test_content_as_text_returns_the_rendered_text_instead_of_html(selector, expected):
+def test_content_as_text_preserves_links_as_markdown(selector, expected):
     body = {"url": PUBLIC_URL, "operation": "content", "format": "text"}
     if selector:
         body["selector"] = selector
@@ -541,7 +550,33 @@ def test_content_as_text_returns_the_rendered_text_instead_of_html(selector, exp
         wait_finished(service, job["id"])
         _, result = request(service, "GET", f"/jobs/{job['id']}/result")
     assert job["format"] == "text"
-    assert result == {"url": PUBLIC_URL, "title": "Example", "text": expected}
+    assert result == {
+        "url": PUBLIC_URL, "title": "Example",
+        "text": f"[{expected}](<https://example.com/listing>)",
+    }
+
+
+def test_markdown_links_preserve_multiline_anchor_text():
+    text = "Listing title\nDescription\nAnother title"
+    links = [
+        {"text": "Listing title\nDescription", "href": "https://example.com/first"},
+        {"text": "Another title", "href": "https://example.com/second"},
+    ]
+    assert rest._markdown_links(text, links) == (
+        "[Listing title\nDescription](<https://example.com/first>)\n"
+        "[Another title](<https://example.com/second>)"
+    )
+
+
+def test_markdown_links_match_repeated_labels_in_document_order():
+    links = [
+        {"text": "read more", "href": "https://example.com/first"},
+        {"text": "read more", "href": "https://example.com/second"},
+    ]
+    assert rest._markdown_links("read more, then read more", links) == (
+        "[read more](<https://example.com/first>), then "
+        "[read more](<https://example.com/second>)"
+    )
 
 
 def test_identity_options_reach_the_context_and_the_proxy_password_stays_private(context_options):
