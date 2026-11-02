@@ -1,0 +1,10 @@
+services:
+  camoufox-rest:
+    build:
+      context: .
+    shm_size: 1gb
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      CAMOUFOX_REST_TOKEN: ${CAMOUFOX_REST_TOKEN:?Set CAMOUFOX_REST_TOKEN before starting}
+    command: ["--trusted-authority", "127.0.0.1:8000"]
