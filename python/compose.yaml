@@ -9,4 +9,7 @@ services:
     mem_limit: 3g         
     environment:
       CAMOUFOX_REST_TOKEN: ${CAMOUFOX_REST_TOKEN:?Set CAMOUFOX_REST_TOKEN before starting}
-    command: ["--trusted-authority", "127.0.0.1:8000"]
+    command: [
+    "--trusted-authority", "127.0.0.1:8000",
+    "--trusted-authority", "192.168.1.19:8000"
+    ]
