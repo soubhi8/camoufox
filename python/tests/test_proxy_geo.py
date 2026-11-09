@@ -109,6 +109,25 @@ def test_no_lookup_when_both_values_are_given(api):
     get.assert_not_called()
 
 
+def test_internal_transport_proxy_does_not_change_identity_or_look_up_geo():
+    gateway = {"server": "socks5://127.0.0.1:12345"}
+    with mock.patch.object(async_api, "_resolve_proxy_geo", new_callable=mock.AsyncMock) as geo:
+        options, context = _new_context("async", None, _transport_proxy=gateway)
+    geo.assert_not_called()
+    assert options["proxy"] == gateway
+    assert "_transport_proxy" not in options
+    assert "timezone_id" not in options
+    assert context.add_init_script.called
+
+
+def test_identity_proxy_cannot_override_the_security_transport():
+    with mock.patch.object(async_api, "_resolve_proxy_geo", new_callable=mock.AsyncMock) as geo:
+        with pytest.raises(ValueError, match="cannot be combined"):
+            _new_context("async", {"server": "http://proxy.example:8080"},
+                         _transport_proxy={"server": "socks5://127.0.0.1:12345"})
+    geo.assert_not_called()
+
+
 def test_lookups_through_a_proxy_get_longer_than_direct_ones(monkeypatch):
     # A proxied probe adds a hop and a TLS handshake; 5 s failed whole launches
     # behind proxies that route the long way round.

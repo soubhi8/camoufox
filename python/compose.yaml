@@ -1,0 +1,15 @@
+services:
+  camoufox-rest:
+    build:
+      context: .
+    restart: unless-stopped        # now "no": it won't come back after the phone restarts
+    ports:
+      - "8000:8000"                # now 127.0.0.1:8000, reachable only from the phone itself
+    shm_size: 1gb                  # Firefox uses /dev/shm; Docker's default 64 MB can crash pages
+    mem_limit: 3g         
+    environment:
+      CAMOUFOX_REST_TOKEN: ${CAMOUFOX_REST_TOKEN:?Set CAMOUFOX_REST_TOKEN before starting}
+    command: [
+    "--trusted-authority", "127.0.0.1:8000",
+    "--trusted-authority", "192.168.1.19:8000"
+    ]
