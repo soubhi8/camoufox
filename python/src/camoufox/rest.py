@@ -40,6 +40,8 @@ TOKEN_ENV_VAR = 'CAMOUFOX_REST_TOKEN'
 MAX_BODY_BYTES = 16 * 1024
 MAX_URL_LENGTH = 2048
 MAX_SELECTOR_LENGTH = 1024
+MAX_ACTIONS = 20
+MAX_CLICKS = 1000
 MAX_RESULT_BYTES = 4 * 1024 * 1024
 MAX_ERROR_BYTES = 1024
 MAX_REQUESTS = 16
@@ -155,6 +157,49 @@ def job_schema(max_timeout: float) -> Dict[str, Any]:
                 ),
                 'example': '#content',
             },
+            'wait_for': {
+                'type': 'string', 'minLength': 1, 'maxLength': MAX_SELECTOR_LENGTH,
+                'description': 'Wait for this selector to be visible before performing click actions.',
+            },
+            'actions': {
+                'type': 'array', 'minItems': 1, 'maxItems': MAX_ACTIONS,
+                'description': (
+                    'Click actions run after navigation and before extracting the result. Repeated actions '
+                    'are rescanned together until no visible controls remain.'
+                ),
+                'items': {
+                    'type': 'object', 'required': ['type', 'selector'], 'additionalProperties': False,
+                    'properties': {
+                        'type': {'type': 'string', 'enum': ['click']},
+                        'selector': {
+                            'type': 'string', 'minLength': 1, 'maxLength': MAX_SELECTOR_LENGTH,
+                            'description': 'Playwright selector for the control to click.',
+                        },
+                        'repeat': {
+                            'type': 'string', 'enum': ['once', 'until_absent'],
+                            'description': 'Click once (default), or repeat while visible controls match.',
+                        },
+                        'max_clicks': {
+                            'type': 'integer', 'minimum': 1, 'maximum': MAX_CLICKS,
+                            'description': 'Required for until_absent; fail if more clicks are needed.',
+                        },
+                        'after': {
+                            'type': 'string', 'enum': ['hidden', 'expanded'],
+                            'description': (
+                                'Required for until_absent: wait for the clicked control to become hidden '
+                                'or detached, or to have aria-expanded=true or detach.'
+                            ),
+                        },
+                        'wait_for': {
+                            'type': 'string', 'minLength': 1, 'maxLength': MAX_SELECTOR_LENGTH,
+                            'description': (
+                                'After each click, wait for this selector to become visible inside the '
+                                'clicked control\'s parent. It must not already be visible.'
+                            ),
+                        },
+                    },
+                },
+            },
             'format': {
                 'type': 'string', 'enum': ['html', 'text'], 'default': 'html',
                 'description': (
@@ -223,6 +268,11 @@ def _check(name: str, value: Any, rule: Dict[str, Any]) -> None:
                 raise InvalidJob(f"{prefix}{field} is required")
         for field, item in value.items():
             _check(prefix + field, item, rule['properties'][field])
+    elif rule['type'] == 'array':
+        if not isinstance(value, list) or not rule['minItems'] <= len(value) <= rule['maxItems']:
+            raise InvalidJob(f"{name} must be an array of {rule['minItems']} to {rule['maxItems']} items")
+        for index, item in enumerate(value):
+            _check(f"{name}[{index}]", item, rule['items'])
     elif rule['type'] == 'string':
         if not isinstance(value, str) or not rule['minLength'] <= len(value) <= rule['maxLength']:
             raise InvalidJob(f"{name} must be a string of {rule['minLength']} to {rule['maxLength']} characters")
@@ -233,6 +283,7 @@ def _check(name: str, value: Any, rule: Dict[str, Any]) -> None:
         low = rule.get('minimum', rule.get('exclusiveMinimum'))
         if (
             isinstance(value, bool) or not isinstance(value, (int, float))
+            or (rule['type'] == 'integer' and isinstance(value, float) and not value.is_integer())
             or value < low or value > rule['maximum'] or not math.isfinite(value)
             or ('exclusiveMinimum' in rule and value == low)
         ):
@@ -250,8 +301,17 @@ def parse_job(body: Any, max_timeout: float) -> Dict[str, Any]:
         raise InvalidJob('format applies only to content')
     if body.get('full_page') and (body['operation'] != 'screenshot' or 'selector' in body):
         raise InvalidJob('full_page applies only to a screenshot without a selector')
+    for action in body.get('actions', []):
+        if action.get('repeat', 'once') == 'until_absent':
+            if 'max_clicks' not in action or 'after' not in action:
+                raise InvalidJob('repeated click actions require max_clicks and after')
+        elif 'max_clicks' in action:
+            raise InvalidJob('max_clicks applies only to repeated click actions')
     defaults = {name: rule['default'] for name, rule in schema['properties'].items() if 'default' in rule}
-    return {**defaults, 'selector': None, 'os': None, 'timezone_id': None, 'geolocation': None, 'proxy': None, **body}
+    return {
+        **defaults, 'selector': None, 'wait_for': None, 'actions': None,
+        'os': None, 'timezone_id': None, 'geolocation': None, 'proxy': None, **body,
+    }
 
 
 def _markdown_links(text: str, links: Sequence[Dict[str, str]]) -> str:
@@ -282,7 +342,13 @@ def openapi(max_timeout: float, token_required: bool) -> Dict[str, Any]:
             'id': {'type': 'string'},
             'status': {'type': 'string', 'enum': ['queued', 'running', 'succeeded', 'failed']},
             'error': {'type': ['string', 'null']},
-            **{name: {'type': rule['type']} for name, rule in job_schema(max_timeout)['properties'].items()},
+            **{
+                name: {
+                    'type': [rule['type'], 'null'] if name in ('wait_for', 'actions') else rule['type'],
+                    **({'items': rule['items']} if rule['type'] == 'array' else {}),
+                }
+                for name, rule in job_schema(max_timeout)['properties'].items()
+            },
         },
     }
     result = {
@@ -442,6 +508,8 @@ class JobRunner:
             waited = f"wait_until {job.params['wait_until']}"
             if job.params['selector']:
                 waited += f" and selector {job.params['selector']!r}"
+            if job.params['wait_for'] or job.params['actions']:
+                waited += ' and click actions or their readiness conditions'
             job.status, job.error = 'failed', f"timed out after {job.params['timeout']:g}s ({waited})"
         except Exception as error:
             job.status, job.error = 'failed', f"{type(error).__name__}: {error}"
@@ -473,6 +541,57 @@ class JobRunner:
         # The job's own timeout bounds every step, rather than Playwright's 30s default.
         page.set_default_timeout(0)
         await page.goto(params['url'], wait_until=params['wait_until'])
+        if params['wait_for']:
+            await page.wait_for_selector(params['wait_for'], state='visible')
+        actions = params['actions'] or []
+        counts = [0] * len(actions)
+        while actions:
+            clicked = False
+            for index, action in enumerate(actions):
+                repeated = action.get('repeat', 'once') == 'until_absent'
+                if not repeated and counts[index]:
+                    continue
+                controls = page.locator(f"{action['selector']} >> visible=true")
+                if repeated and not await controls.count():
+                    continue
+                if repeated and counts[index] >= action['max_clicks']:
+                    raise InvalidJob(f"click limit reached for {action['selector']!r}")
+                target = await controls.first.element_handle()
+                if target is None:
+                    raise InvalidJob(f"click target disappeared: {action['selector']!r}")
+                parent = None
+                try:
+                    if action.get('wait_for'):
+                        parent = await target.query_selector('xpath=..')
+                        if parent is None:
+                            raise InvalidJob('click target has no parent for wait_for')
+                        existing = await parent.query_selector(f"{action['wait_for']} >> visible=true")
+                        if existing:
+                            await existing.dispose()
+                            raise InvalidJob('click wait_for is already visible in the target parent')
+                    await target.click()
+                    if action.get('after') == 'hidden':
+                        await target.wait_for_element_state('hidden')
+                    elif action.get('after') == 'expanded':
+                        state = await page.wait_for_function(
+                            "element => !element.isConnected || element.getAttribute('aria-expanded') === 'true'",
+                            arg=target,
+                        )
+                        await state.dispose()
+                    if parent is not None:
+                        ready = await parent.wait_for_selector(action['wait_for'], state='visible')
+                        if ready is not None:
+                            await ready.dispose()
+                    if repeated and await controls.evaluate_all('(elements, target) => elements.includes(target)', target):
+                        raise InvalidJob(f"clicked control still matches {action['selector']!r}")
+                finally:
+                    if parent is not None:
+                        await parent.dispose()
+                    await target.dispose()
+                counts[index] += 1
+                clicked = True
+            if not clicked:
+                break
         screenshot = params['operation'] == 'screenshot'
         element = None
         if params['selector']:

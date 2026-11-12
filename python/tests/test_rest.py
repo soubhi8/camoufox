@@ -545,6 +545,233 @@ def test_a_selector_waits_for_and_returns_only_that_element(operation, state, fi
     assert (element.selector, element.state) == ("#main", state)
 
 
+@pytest.mark.parametrize("operation", ["content", "screenshot"])
+def test_click_actions_rescan_nested_collapsed_and_load_more_controls(monkeypatch, operation):
+    class Handle:
+        async def dispose(self):
+            pass
+
+    class Control(Handle):
+        def __init__(self, page, name, kind):
+            self.page, self.name, self.kind = page, name, kind
+
+        async def click(self):
+            self.page.events.append(("click", self.name))
+
+        async def wait_for_element_state(self, state):
+            assert state == "hidden"
+            self.page.controls.remove(self)
+
+        async def query_selector(self, selector):
+            assert selector == "xpath=.."
+            return Parent(self.page, self.name)
+
+    class Parent(Handle):
+        def __init__(self, page, name):
+            self.page, self.name = page, name
+
+        async def query_selector(self, selector):
+            assert selector == ".loaded >> visible=true"
+            return None
+
+        async def wait_for_selector(self, selector, state):
+            assert (selector, state) == (".loaded", "visible")
+            self.page.events.append(("loaded", self.name))
+            if self.name == "load-more":
+                self.page.controls.append(Control(self.page, "nested", "collapsed"))
+            return Handle()
+
+    class Locator:
+        def __init__(self, page, selector):
+            self.page, self.selector = page, selector
+            self.first = self
+
+        def matches(self):
+            return [control for control in self.page.controls if control.kind == self.selector]
+
+        async def count(self):
+            return len(self.matches())
+
+        async def element_handle(self):
+            return self.matches()[0]
+
+        async def evaluate_all(self, expression, target):
+            return target in self.matches()
+
+    def locator(page, selector):
+        return Locator(page, selector.removesuffix(" >> visible=true"))
+
+    async def wait_for_function(page, expression, *, arg):
+        assert arg.kind == "collapsed"
+        page.controls.remove(arg)
+        if arg.name == "parent":
+            page.controls.append(Control(page, "load-more", "more"))
+        return Handle()
+
+    async def on_goto(context, url):
+        context.page.controls = [Control(context.page, "parent", "collapsed")]
+        context.page.events = []
+
+    monkeypatch.setattr(FakePage, "locator", locator)
+    monkeypatch.setattr(FakePage, "wait_for_function", wait_for_function, raising=False)
+    service, launcher = make_service(FakeBrowser(on_goto=on_goto))
+    actions = [
+        {"type": "click", "selector": "collapsed", "repeat": "until_absent",
+         "max_clicks": 2, "after": "expanded"},
+        {"type": "click", "selector": "more", "repeat": "until_absent",
+         "max_clicks": 1, "after": "hidden", "wait_for": ".loaded"},
+    ]
+    with service:
+        status, job = request(service, "POST", "/jobs", {
+            "url": PUBLIC_URL, "operation": operation, "actions": actions,
+        })
+        assert status == 202
+        assert wait_finished(service, job["id"])["status"] == "succeeded"
+        result = request(service, "GET", f"/jobs/{job['id']}/result")[1]
+        if operation == "content":
+            assert result["html"] == "<html>example</html>"
+        else:
+            assert base64.b64decode(result["screenshot"]) == b"\x89PNG"
+    assert launcher.browser.contexts[0].page.events == [
+        ("click", "parent"), ("click", "load-more"), ("loaded", "load-more"), ("click", "nested"),
+    ]
+
+
+def test_single_click_and_initial_wait_precede_result_selection(monkeypatch):
+    events = []
+
+    class Control:
+        async def click(self):
+            events.append("click")
+
+        async def dispose(self):
+            pass
+
+    class Locator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        async def element_handle(self):
+            events.append("target")
+            return Control()
+
+    async def wait_for_selector(page, selector, state):
+        events.append((selector, state))
+        return FakeElement(selector, state)
+
+    monkeypatch.setattr(FakePage, "locator", lambda page, selector: Locator())
+    monkeypatch.setattr(FakePage, "wait_for_selector", wait_for_selector)
+    service, _ = make_service()
+    with service:
+        _, job = request(service, "POST", "/jobs", {
+            "url": PUBLIC_URL, "operation": "content", "selector": "#main", "wait_for": "#comments",
+            "actions": [{"type": "click", "selector": "button"}],
+        })
+        assert wait_finished(service, job["id"])["status"] == "succeeded"
+        assert request(service, "GET", f"/jobs/{job['id']}/result")[1]["html"] == "<div>element</div>"
+    assert events == [("#comments", "visible"), "target", "click", ("#main", "attached")]
+
+
+@pytest.mark.parametrize("actions", [
+    "click", [], [{}], [{"type": "click", "selector": ""}],
+    [{"type": "click", "selector": "button", "repeat": "until_absent"}],
+    [{"type": "click", "selector": "button", "max_clicks": 2}],
+    [{"type": "click", "selector": "button", "repeat": "until_absent", "after": "hidden", "max_clicks": 0}],
+    [{"type": "click", "selector": "button", "repeat": "until_absent", "after": "hidden", "max_clicks": True}],
+    [{"type": "click", "selector": "button", "repeat": "until_absent", "after": "hidden", "max_clicks": 1.5}],
+    [{"type": "click", "selector": "button", "repeat": "until_absent", "after": "wrong", "max_clicks": 1}],
+])
+def test_invalid_click_actions_are_rejected(actions):
+    with pytest.raises(rest.InvalidJob):
+        rest.parse_job({"url": PUBLIC_URL, "operation": "content", "actions": actions}, 30)
+
+
+@pytest.mark.parametrize("sticky, limit", [(True, 5), (False, 1)])
+def test_repeated_click_fails_on_no_progress_or_limit(monkeypatch, sticky, limit):
+    class Control:
+        def __init__(self, page):
+            self.page = page
+
+        async def click(self):
+            pass
+
+        async def wait_for_element_state(self, state):
+            if not sticky:
+                self.page.controls.pop(0)
+
+        async def dispose(self):
+            pass
+
+    class Locator:
+        def __init__(self, page):
+            self.page = page
+            self.first = self
+
+        async def count(self):
+            return len(self.page.controls)
+
+        async def element_handle(self):
+            return self.page.controls[0]
+
+        async def evaluate_all(self, expression, target):
+            return target in self.page.controls
+
+    async def on_goto(context, url):
+        context.page.controls = [Control(context.page), Control(context.page)]
+
+    monkeypatch.setattr(FakePage, "locator", lambda page, selector: Locator(page))
+    service, launcher = make_service(FakeBrowser(on_goto=on_goto))
+    with service:
+        _, job = request(service, "POST", "/jobs", {
+            "url": PUBLIC_URL, "operation": "content",
+            "actions": [{"type": "click", "selector": "button", "repeat": "until_absent",
+                         "max_clicks": limit, "after": "hidden"}],
+        })
+        finished = wait_finished(service, job["id"])
+    assert finished["status"] == "failed"
+    assert ("still matches" if sticky else "click limit") in finished["error"]
+    assert launcher.browser.contexts[0].closed
+
+
+def test_click_completion_uses_the_job_timeout(monkeypatch):
+    class Control:
+        async def click(self):
+            pass
+
+        async def wait_for_element_state(self, state):
+            await asyncio.sleep(60)
+
+        async def dispose(self):
+            pass
+
+    class Locator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        async def count(self):
+            return 1
+
+        async def element_handle(self):
+            return Control()
+
+    monkeypatch.setattr(FakePage, "locator", lambda page, selector: Locator())
+    service, launcher = make_service(timeout=0.2)
+    with service:
+        _, job = request(service, "POST", "/jobs", {
+            "url": PUBLIC_URL, "operation": "content",
+            "actions": [{"type": "click", "selector": "button", "repeat": "until_absent",
+                         "max_clicks": 2, "after": "hidden"}],
+        })
+        finished = wait_finished(service, job["id"])
+    assert finished["status"] == "failed"
+    assert "timed out" in finished["error"]
+    assert launcher.browser.contexts[0].closed
+
+
 @pytest.mark.parametrize("selector, expected", [(None, "example"), ("#main", "element")])
 def test_content_as_text_preserves_links_as_markdown(selector, expected):
     body = {"url": PUBLIC_URL, "operation": "content", "format": "text"}

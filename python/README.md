@@ -388,13 +388,64 @@ curl -s --oauth2-bearer "$CAMOUFOX_REST_TOKEN" \
 
 Jobs support `content` (HTML or rendered text, with hyperlinks formatted as
 Markdown in text mode) and `screenshot`, with optional selectors, navigation
-waits, timeouts, and per-job identity settings. Per-job
+waits, click actions, timeouts, and per-job identity settings. Per-job
 proxies require `--allow-private-networks`: a remote proxy's DNS and connections
 cannot be constrained by the local gateway.
 `--launch-options` configures the shared browser and is available only to the
 service operator. Public-only mode rejects `proxy`, `from_options`,
 `persistent_context` and nested SDK `launch_options`, and enforces its required Firefox
 preferences even if launch options try to override them.
+
+For a comment page, `actions` can expand collapsed replies and load further
+replies before extracting content. This example describes a hypothetical page;
+the selectors and completion conditions must match the actual site:
+
+```json
+{
+  "url": "https://example.com/comments",
+  "operation": "content",
+  "format": "text",
+  "wait_for": "#comments",
+  "actions": [
+    {
+      "type": "click",
+      "selector": "button.reply-toggle[aria-expanded='false']",
+      "repeat": "until_absent",
+      "max_clicks": 100,
+      "after": "expanded"
+    },
+    {
+      "type": "click",
+      "selector": "button.load-replies",
+      "repeat": "until_absent",
+      "max_clicks": 100,
+      "after": "hidden",
+      "wait_for": ".replies-loaded"
+    }
+  ]
+}
+```
+
+`wait_for` at the job level waits for a visible element before clicking; the
+existing `selector` still selects the result after clicking. Without `repeat`,
+an action clicks once and waits for its target to appear. Repeated actions are
+rescanned together, one visible control per action at a time, so one action
+can reveal new controls for another. They stop when none match. Each requires
+`max_clicks` (1-1000) and `after`: `expanded` waits for the clicked control's
+`aria-expanded` to become `true` or for it to detach; `hidden` waits for it to
+become hidden or detach. The clicked control must no longer match its visible
+selector after completion; otherwise the job fails rather than clicking it
+again. Reaching a click limit with matching controls remaining also fails.
+
+For asynchronous loading, an action's optional `wait_for` is a Playwright
+selector relative to the clicked control's parent. It must not be visible
+before the click and must become visible after it; choose a per-expansion
+completion marker, not a reply that was already present. A control's state
+change alone does not guarantee its network-loaded replies have arrived.
+The job timeout bounds all waits. A repeated action with no visible matches
+finishes immediately, so use the job-level `wait_for` when controls load
+later. Clicks can navigate or submit forms. This operates on the current page,
+not separate tabs, and does not collect comments discarded by virtualization.
 
 The same token and public-only defaults apply to Python `RestService`.
 A custom launcher must accept the `firefox_user_prefs` keyword argument and
