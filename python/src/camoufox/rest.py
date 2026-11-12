@@ -159,7 +159,10 @@ def job_schema(max_timeout: float) -> Dict[str, Any]:
             },
             'wait_for': {
                 'type': 'string', 'minLength': 1, 'maxLength': MAX_SELECTOR_LENGTH,
-                'description': 'Wait for this selector to be visible before performing click actions.',
+                'description': (
+                    'Wait for this selector to be visible before performing click actions and/or '
+                    'extracting the result.'
+                ),
             },
             'actions': {
                 'type': 'array', 'minItems': 1, 'maxItems': MAX_ACTIONS,
