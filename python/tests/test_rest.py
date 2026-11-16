@@ -593,7 +593,8 @@ def test_click_actions_rescan_nested_collapsed_and_load_more_controls(monkeypatc
             return len(self.matches())
 
         async def element_handle(self):
-            return self.matches()[0]
+            matches = self.matches()
+            return matches[0] if matches else None
 
         async def evaluate_all(self, expression, target):
             return target in self.matches()
