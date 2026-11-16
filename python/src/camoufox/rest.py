@@ -190,7 +190,7 @@ def job_schema(max_timeout: float) -> Dict[str, Any]:
                             'type': 'string', 'enum': ['hidden', 'expanded'],
                             'description': (
                                 'Required for until_absent: wait for the clicked control to become hidden '
-                                'or detached, or to have aria-expanded=true or detach.'
+                                'or detached, or to have aria-expanded=true or be detached.'
                             ),
                         },
                         'wait_for': {
