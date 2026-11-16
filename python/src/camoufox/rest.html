@@ -160,7 +160,7 @@
 
   // The same job as API calls, to copy into a script. The token stays a variable, never the value.
   function calls(job) {
-    const fields = ['url', 'operation', 'wait_until', 'selector', 'format', 'full_page', 'os', 'timezone_id', 'geolocation', 'proxy', 'timeout'];
+    const fields = ['url', 'operation', 'wait_until', 'wait_for', 'actions', 'selector', 'format', 'full_page', 'os', 'timezone_id', 'geolocation', 'proxy', 'timeout'];
     const body = Object.fromEntries(fields.filter((name) => job[name] != null).map((name) => [name, job[name]]));
     const auth = $('token').value ? ' -H "Authorization: Bearer $CAMOUFOX_REST_TOKEN"' : '';
     const base = location.origin;
