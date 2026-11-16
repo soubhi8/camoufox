@@ -732,6 +732,7 @@ def test_repeated_click_fails_on_no_progress_or_limit(monkeypatch, sticky, limit
         })
         finished = wait_finished(service, job["id"])
     assert finished["status"] == "failed"
+    assert finished["error"].startswith("JobExecutionError: ")
     assert ("still matches" if sticky else "click limit") in finished["error"]
     assert launcher.browser.contexts[0].closed
 
@@ -1098,6 +1099,11 @@ def test_the_api_description_and_its_docs_load_without_a_token():
     body = spec["paths"]["/jobs"]["post"]["requestBody"]["content"]["application/json"]["schema"]
     assert body == rest.job_schema(45)
     assert body["properties"]["timeout"]["maximum"] == 45
+    status_schema = spec["paths"]["/jobs"]["post"]["responses"]["202"]["content"]["application/json"]["schema"]
+    default_job = rest.parse_job({"url": PUBLIC_URL, "operation": "content"}, 45)
+    for name, value in default_job.items():
+        if value is None:
+            assert "null" in status_schema["properties"][name]["type"]
     assert spec["security"] == [{"token": []}]
     assert docs == rest.DOCS_PAGE and b"/openapi.json" in docs
     assert "default-src 'none'" in policy and "connect-src 'self'" in policy

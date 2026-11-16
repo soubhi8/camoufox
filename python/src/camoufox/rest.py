@@ -42,6 +42,7 @@ MAX_URL_LENGTH = 2048
 MAX_SELECTOR_LENGTH = 1024
 MAX_ACTIONS = 20
 MAX_CLICKS = 1000
+NULLABLE_JOB_FIELDS = ('selector', 'wait_for', 'actions', 'os', 'timezone_id', 'geolocation', 'proxy')
 MAX_RESULT_BYTES = 4 * 1024 * 1024
 MAX_ERROR_BYTES = 1024
 MAX_REQUESTS = 16
@@ -99,6 +100,10 @@ DOCS_CSP = (
 
 class InvalidJob(ValueError):
     """The submitted job is malformed or not allowed."""
+
+
+class JobExecutionError(RuntimeError):
+    """A submitted job failed while interacting with the page."""
 
 
 class BlockedURL(InvalidJob):
@@ -312,8 +317,7 @@ def parse_job(body: Any, max_timeout: float) -> Dict[str, Any]:
             raise InvalidJob('max_clicks applies only to repeated click actions')
     defaults = {name: rule['default'] for name, rule in schema['properties'].items() if 'default' in rule}
     return {
-        **defaults, 'selector': None, 'wait_for': None, 'actions': None,
-        'os': None, 'timezone_id': None, 'geolocation': None, 'proxy': None, **body,
+        **defaults, **dict.fromkeys(NULLABLE_JOB_FIELDS), **body,
     }
 
 
@@ -347,7 +351,7 @@ def openapi(max_timeout: float, token_required: bool) -> Dict[str, Any]:
             'error': {'type': ['string', 'null']},
             **{
                 name: {
-                    'type': [rule['type'], 'null'] if name in ('wait_for', 'actions') else rule['type'],
+                    'type': [rule['type'], 'null'] if name in NULLABLE_JOB_FIELDS else rule['type'],
                     **({'items': rule['items']} if rule['type'] == 'array' else {}),
                 }
                 for name, rule in job_schema(max_timeout)['properties'].items()
@@ -558,20 +562,20 @@ class JobRunner:
                 if repeated and not await controls.count():
                     continue
                 if repeated and counts[index] >= action['max_clicks']:
-                    raise InvalidJob(f"click limit reached for {action['selector']!r}")
+                    raise JobExecutionError(f"click limit reached for {action['selector']!r}")
                 target = await controls.first.element_handle()
                 if target is None:
-                    raise InvalidJob(f"click target disappeared: {action['selector']!r}")
+                    raise JobExecutionError(f"click target disappeared: {action['selector']!r}")
                 parent = None
                 try:
                     if action.get('wait_for'):
                         parent = await target.query_selector('xpath=..')
                         if parent is None:
-                            raise InvalidJob('click target has no parent for wait_for')
+                            raise JobExecutionError('click target has no parent for wait_for')
                         existing = await parent.query_selector(f"{action['wait_for']} >> visible=true")
                         if existing:
                             await existing.dispose()
-                            raise InvalidJob('click wait_for is already visible in the target parent')
+                            raise JobExecutionError('click wait_for is already visible in the target parent')
                     await target.click()
                     if action.get('after') == 'hidden':
                         await target.wait_for_element_state('hidden')
@@ -586,7 +590,7 @@ class JobRunner:
                         if ready is not None:
                             await ready.dispose()
                     if repeated and await controls.evaluate_all('(elements, target) => elements.includes(target)', target):
-                        raise InvalidJob(f"clicked control still matches {action['selector']!r}")
+                        raise JobExecutionError(f"clicked control still matches {action['selector']!r}")
                 finally:
                     if parent is not None:
                         await parent.dispose()
